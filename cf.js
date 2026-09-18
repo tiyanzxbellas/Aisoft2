@@ -169,7 +169,11 @@ export async function proxyFetch(targetUrl, opts = {}) {
     try {
       const { statusCode, resHeaders, text } = await requestText(attempt.url, headers);
 
-      if (statusCode === 200) {
+      // Cloudflare sometimes returns the challenge document with HTTP 200
+      // (especially when it is wrapped by another proxy). Do not treat that
+      // HTML as a successful API response.
+      const challengeDocument = /just a moment|cf-chl|challenge-platform|cdn-cgi\/challenge|enable javascript and cookies|_cf_chl_opt/i.test(String(text));
+      if (statusCode === 200 && !challengeDocument) {
         try {
           return JSON.parse(text);
         } catch {
@@ -177,8 +181,9 @@ export async function proxyFetch(targetUrl, opts = {}) {
         }
       }
 
-      const err = new Error(summarizeError(statusCode, text));
-      err.statusCode = statusCode;
+      const effectiveStatus = challengeDocument && statusCode === 200 ? 403 : statusCode;
+      const err = new Error(summarizeError(effectiveStatus, text));
+      err.statusCode = effectiveStatus;
       err.via = attempt.kind;
       err.headers = resHeaders;
       try {
@@ -189,7 +194,7 @@ export async function proxyFetch(targetUrl, opts = {}) {
 
       lastErr = err;
 
-      const retryable = isCloudflareChallenge(statusCode, text) || statusCode === 403 || statusCode >= 500;
+      const retryable = isCloudflareChallenge(effectiveStatus, text) || effectiveStatus === 403 || effectiveStatus >= 500;
       if (retryable && i < attempts.length - 1) {
         await sleep(200 + i * 300);
         continue;
