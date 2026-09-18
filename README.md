@@ -6,18 +6,17 @@ Semua request ke upstream **wajib** lewat `cf.js` (`proxyFetch` / `proxyStream`)
 
 ## Kenapa 403 "Just a moment..."?
 
-`xyz-api.animein.net` diproteksi Cloudflare JS challenge. Request langsung dari IP datacenter (Vercel, dll) kena halaman *Just a moment...*. Header saja tidak cukup.
+`xyz-api.animein.net` diproteksi Cloudflare JS challenge untuk request dari IP datacenter. Header saja tidak cukup — dan header pun **tidak boleh dikirim sewenang-wenang**: request yang mengirim `Sec-Fetch-Site: same-origin` + `Origin` + `Sec-Ch-Ua` padahal aslinya datang dari edge Cloudflare (bukan browser) terbaca sebagai "fake browser" dan langsung disuguhi challenge 403.
 
-`cf.js` menangani ini dengan urutan:
+Oleh karena itu arsitekturnya:
 
-1. Header dari `cf.js` (UA pool, `Origin`, `Referer`, `X-Proxy-Secret`, Sec-CH, ...)
-2. Untuk host `*.animein.net` / `*.animeinweb.com`, request **pertama** lewat CORS proxy:
-   `https://cf.tiyanstores.workers.dev/?url=<URL_TARGET>`
-3. Kalau worker gagal, baru coba langsung ke target
+1. `cf.js` (`proxyFetch` / `proxyStream`) — untuk host `*.animein.net` / `*.animeinweb.com`, request **pertama** lewat CORS worker: `https://cf.tiyanstores.workers.dev/?url=<URL_TARGET>`, baru fallback langsung.
+2. **Ke worker, cf.js hanya mengirim `X-Proxy-Secret`** (+ `Range` untuk stream video). Profil header browser dibangun oleh **worker** (`worker.js`) — satu set kecil dan konsisten (UA, Accept, Accept-Language, Referer same-site, X-Requested-With) yang terbukti lolos challenge.
+3. Worker **tidak pernah** meneruskan header pemanggil apa adanya. Kalau suatu saat Anda menulis pemanggil baru, jangan sertakan `Sec-Fetch-*` / `Origin` / `Sec-Ch-Ua` ke worker.
 
-Worker harus dideploy dari `worker.js` (atau disamakan dengan file itu). Set secret `PROXY_SECRET` di Cloudflare Worker dengan nilai yang sama seperti environment variable `PROXY_SECRET` di Vercel. Worker hanya meneruskan request; CORS tidak bisa melewati JavaScript challenge Cloudflare.
+Worker harus dideploy dari `worker.js` (Worker Settings > edit code, paste, deploy) dan set secret `PROXY_SECRET` di Cloudflare Worker dengan nilai yang sama seperti environment variable `PROXY_SECRET` di Vercel. Kalau `PROXY_SECRET` di-set di worker, request tanpa `X-Proxy-Secret` yang cocok ditolak — worker tidak bisa disalahgunakan sebagai proxy umum.
 
-Jika masih mendapat `Cloudflare challenge (Just a moment...) [status 403]`, masalahnya ada di rule Cloudflare pada origin `xyz-api.animein.net`, bukan di CORS API. Buat rule WAF/Managed Challenge **Skip** untuk route API (misalnya `/3/2/*`) atau allowlist request dari Worker, lalu purge/deploy ulang rule tersebut. Jangan mencoba menyelesaikannya dengan mengganti User-Agent saja.
+Jika masih mendapat `Cloudflare challenge (Just a moment...) [status 403]` setelah worker di-redeploy, masalahnya ada di rule Cloudflare pada origin `xyz-api.animein.net` (misalnya rule-nya berubah mem-bypass route API). Solusinya: buat rule WAF/Managed Challenge **Skip** untuk route API (misalnya `/3/2/*`) di Cloudflare origin, lalu purge/deploy ulang rule tersebut. Jangan mencoba menyelesaikannya dengan mengganti User-Agent di `cf.js` atau worker.
 
 ## Deploy ke Vercel
 
