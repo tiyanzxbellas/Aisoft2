@@ -1,6 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import { proxyFetch, proxyStream, fetchJson, testSecrets, getProxyConfig } from './cf.js';
+import { proxyFetch, proxyStream, fetchJson, getProxyConfig } from './cf.js';
 
 dotenv.config();
 
@@ -185,27 +185,7 @@ app.get('/v1/health', async (req, res) => {
   });
 });
 
-// Debug endpoint to test secret rotation from Vercel network (allows fetch_page tool to brute force)
-app.get('/v1/debug/secret-test', async (req, res) => {
-  const { secrets } = req.query;
-  const list = secrets ? (Array.isArray(secrets) ? secrets : secrets.split(',')) : [
-    'animein-secure-proxy-key-123',
-    'animein-secure-proxy-key-456',
-    'animein-secure-proxy-key',
-    'animein-web-key',
-    'animein-key-123',
-    '',
-    'null'
-  ];
-  const target = `${BASE_API}/explore/genre`;
-  try {
-    const results = await testSecrets(target, list);
-    res.json({ status: true, target, results });
-  } catch (e) {
-    res.status(500).json({ status: false, message: e.message });
-  }
-});
-
+// Secret testing is intentionally not exposed as a public endpoint.
 app.get('/v1/proxy', async (req, res) => {
   try {
     const { url } = req.query;

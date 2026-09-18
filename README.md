@@ -15,7 +15,9 @@ Semua request ke upstream **wajib** lewat `cf.js` (`proxyFetch` / `proxyStream`)
    `https://cf.tiyanstores.workers.dev/?url=<URL_TARGET>`
 3. Kalau worker gagal, baru coba langsung ke target
 
-Worker ini sudah terbukti tembus ke genre, popular, detail, episode, dan schedule.
+Worker harus dideploy dari `worker.js` (atau disamakan dengan file itu). Set secret `PROXY_SECRET` di Cloudflare Worker dengan nilai yang sama seperti environment variable `PROXY_SECRET` di Vercel. Worker hanya meneruskan request; CORS tidak bisa melewati JavaScript challenge Cloudflare.
+
+Jika masih mendapat `Cloudflare challenge (Just a moment...) [status 403]`, masalahnya ada di rule Cloudflare pada origin `xyz-api.animein.net`, bukan di CORS API. Buat rule WAF/Managed Challenge **Skip** untuk route API (misalnya `/3/2/*`) atau allowlist request dari Worker, lalu purge/deploy ulang rule tersebut. Jangan mencoba menyelesaikannya dengan mengganti User-Agent saja.
 
 ## Deploy ke Vercel
 
