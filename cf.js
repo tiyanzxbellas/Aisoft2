@@ -3,7 +3,6 @@
 // Host animein kena Cloudflare JS challenge dari IP datacenter, jadi path utama
 // adalah CORS worker (CF_PROXY) + header browser di bawah.
 import { request, Agent, setGlobalDispatcher, interceptors } from 'undici';
-import tls from 'tls';
 
 const UA_POOL = [
   {
@@ -40,22 +39,9 @@ function getProxySecret() {
   return process.env.PROXY_SECRET || DEFAULT_PROXY_SECRET;
 }
 
-const defaultCiphers = tls.DEFAULT_CIPHERS.split(':');
-const shuffledCiphers = [
-  defaultCiphers[1],
-  defaultCiphers[2],
-  defaultCiphers[0],
-  ...defaultCiphers.slice(3)
-].join(':');
-
 const agent = new Agent({
-  allowH2: true,
   keepAliveTimeout: 30000,
-  keepAliveMaxTimeout: 60000,
-  connect: {
-    ciphers: shuffledCiphers,
-    rejectUnauthorized: true
-  }
+  keepAliveMaxTimeout: 60000
 }).compose(
   interceptors.redirect({ maxRedirections: 5 }),
   interceptors.retry({ maxRetries: 2 })
@@ -88,14 +74,19 @@ export function isCloudflareChallenge(statusCode, text = '') {
   return /just a moment|cf-chl|challenge-platform|cdn-cgi\/challenge|enable javascript and cookies|_cf_chl_opt/i.test(String(text));
 }
 
-// Header untuk path worker: hanya secret (+ passthrough opsional).
-// JANGAN menyertakan UA / Origin / Sec-Fetch-* / Sec-Ch-Ua di sini —
-// worker membangun profil browser-nya sendiri. Kalau header identitas itu
-// diteruskan mentah sampai ke origin, Cloudflare melihat inkonsistensi
-// (request cross-site dari non-browser yang mengklaim "same-origin") dan
-// menyajikan JS challenge "Just a moment..." (status 403).
+// Header untuk request dari cf.js ke worker (https://cf.tiyanstores.workers.dev/...).
+// Cloudflare edge di depan *.workers.dev membutuhkan User-Agent dan Accept
+// standar agar tidak dianggap bot / memicu Browser Integrity Check (BIC 403).
+// Namun JANGAN sertakan Origin / Sec-Fetch-Site: same-origin / Sec-Ch-Ua di sini,
+// karena jika diteruskan ke origin xyz-api.animein.net akan memicu JS challenge.
 function workerHeaders(targetUrl, extra = {}) {
-  const headers = { 'X-Proxy-Secret': extra.secret || getProxySecret() };
+  const ua = pickUA();
+  const headers = {
+    'User-Agent': ua.ua,
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+    'X-Proxy-Secret': extra.secret || getProxySecret()
+  };
   if (extra.headers) Object.assign(headers, extra.headers);
   return headers;
 }
@@ -166,6 +157,7 @@ async function requestText(url, headers, timeouts = {}) {
 export async function proxyFetch(targetUrl, opts = {}) {
   const attempts = buildAttempts(targetUrl, opts);
   let lastErr = null;
+  const attemptsLog = [];
 
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i];
@@ -173,7 +165,7 @@ export async function proxyFetch(targetUrl, opts = {}) {
 
     if (attempt.kind === 'worker') {
       // Worker menerjemahkan request ini menjadi profil browser yang
-      // konsisten. Kita hanya mengirim secret, bukan header identitas.
+      // konsisten. Kita hanya mengirim secret dan header client dasar.
       headers = workerHeaders(targetUrl, {
         secret: opts.secret,
         headers: opts.headers
@@ -212,6 +204,12 @@ export async function proxyFetch(targetUrl, opts = {}) {
         err.body = String(text || '').slice(0, 400);
       }
 
+      attemptsLog.push({
+        kind: attempt.kind,
+        statusCode: effectiveStatus,
+        error: err.message
+      });
+      err.attempts = attemptsLog;
       lastErr = err;
 
       const retryable = isCloudflareChallenge(effectiveStatus, text) || effectiveStatus === 403 || effectiveStatus >= 500;
@@ -224,6 +222,11 @@ export async function proxyFetch(targetUrl, opts = {}) {
       if (!err.statusCode) {
         lastErr = new Error(`${attempt.kind} fetch failed: ${err.message}`);
         lastErr.via = attempt.kind;
+        attemptsLog.push({
+          kind: attempt.kind,
+          error: err.message
+        });
+        lastErr.attempts = attemptsLog;
         if (i < attempts.length - 1) {
           await sleep(250 + i * 350);
           continue;
@@ -231,6 +234,7 @@ export async function proxyFetch(targetUrl, opts = {}) {
         throw lastErr;
       }
       lastErr = err;
+      lastErr.attempts = attemptsLog;
       if (i < attempts.length - 1) {
         await sleep(200 + i * 300);
         continue;
@@ -239,6 +243,7 @@ export async function proxyFetch(targetUrl, opts = {}) {
     }
   }
 
+  if (lastErr) lastErr.attempts = attemptsLog;
   throw lastErr || new Error('Target fetch failed on all paths');
 }
 
@@ -280,10 +285,13 @@ export async function proxyStream(targetUrl, incomingHeaders = {}) {
     let headersToSend;
 
     if (attempt.kind === 'worker') {
-      // Sama seperti proxyFetch: profil browser dibangun oleh worker,
-      // kita hanya mengirim secret + Range (butuh passthrough untuk
-      // seek/partial content video).
-      headersToSend = { 'X-Proxy-Secret': getProxySecret() };
+      const ua = pickUA();
+      headersToSend = {
+        'User-Agent': ua.ua,
+        'Accept': incomingHeaders.accept || incomingHeaders['accept'] || '*/*',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        'X-Proxy-Secret': getProxySecret()
+      };
     } else {
       const ua = pickUA();
       headersToSend = {

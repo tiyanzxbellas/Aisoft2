@@ -168,7 +168,7 @@ app.get('/v1/health', async (req, res) => {
     const genreCount = r.data?.genre?.length || 0;
     checks.upstream = { ok: true, genre_count: genreCount, keys: Object.keys(r).slice(0, 5) };
   } catch (e) {
-    checks.upstream = { ok: false, error: e.message, status: e.statusCode || null, via: e.via || null };
+    checks.upstream = { ok: false, error: e.message, status: e.statusCode || null, via: e.via || null, attempts: e.attempts || null };
   }
   try {
     const j = await fetchJson('https://api.jikan.moe/v4/genres/anime');
