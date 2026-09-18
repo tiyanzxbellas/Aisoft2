@@ -1,0 +1,372 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+cf.js
+package.json
+server.js
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitignore">
+node_modules
+.env
+package-lock.json
+</file>
+
+<file path="package.json">
+{
+  "name": "nefusoft-api",
+  "version": "1.0.0",
+  "main": "cf.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "undici": "^7.24.6"
+  }
+}
+</file>
+
+<file path="cf.js">
+import { request, Agent, setGlobalDispatcher } from 'undici';
+
+const UA_POOL =[
+  {
+    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    ch: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    pf: '"Windows"'
+  },
+  {
+    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    ch: '"Chromium";v="121", "Not(A:Brand";v="24", "Google Chrome";v="121"',
+    pf: '"macOS"'
+  },
+  {
+    ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    ch: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    pf: '"Linux"'
+  }
+];
+
+const agent = new Agent({
+  connect: { rejectUnauthorized: false },
+  allowH2: true,
+  maxRedirections: 5,
+  keepAliveTimeout: 15000,
+});
+
+setGlobalDispatcher(agent);
+
+export async function proxyFetch(targetUrl) {
+  const id = UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
+  const urlObj = new URL(targetUrl);
+  const originUrl = `${urlObj.protocol}//${urlObj.host}`;
+
+  try {
+    const { statusCode, body } = await request(targetUrl, {
+      method: 'GET',
+      headers: {
+        'Host': urlObj.host,
+        'User-Agent': id.ua,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Origin': originUrl,
+        'Referer': `${originUrl}/`,
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Proxy-Secret': 'animein-secure-proxy-key-123',
+        'Sec-Ch-Ua': id.ch,
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': id.pf,
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'Connection': 'keep-alive'
+      },
+    });
+
+    if (statusCode !== 200) {
+        throw new Error(`Target returned status ${statusCode}`);
+    }
+
+    const text = await body.text();
+    return JSON.parse(text);
+  } catch (err) {
+    throw err;
+  }
+}
+</file>
+
+<file path="server.js">
+import express from 'express';
+import dotenv from 'dotenv';
+import { proxyFetch } from './cf.js';
+
+dotenv.config();
+
+const app = express();
+const port = process.env.PORT || 3000;
+const BASE_API = process.env.BASE_API;
+
+app.get('/', (req, res) => {
+  res.json({
+    status: true,
+    message: "MEMEKKK"
+  });
+});
+
+app.get('/v1/schedule', async (req, res) => {
+  try {
+    const days =['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU', 'RANDOM'];
+    
+    const results = await Promise.all(
+      days.map(day => proxyFetch(`${BASE_API}/schedule/data?day=${day}`))
+    );
+
+    const scheduleData = {};
+    days.forEach((day, index) => {
+      scheduleData[day] = results[index]?.data?.movie ||[];
+    });
+
+    res.json({
+      status: true,
+      data: scheduleData
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.get('/v1/ongoing', async (req, res) => {
+  try {
+    const days =['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU', 'RANDOM'];
+    
+    const results = await Promise.all(
+      days.map(day => proxyFetch(`${BASE_API}/schedule/data?day=${day}`))
+    );
+
+    const allMovies = results.flatMap(r => r?.data?.movie ||[]);
+    
+    const seen = new Set();
+    const ongoingList = allMovies.filter(movie => {
+      const isOngoing = movie.status === 'ONGOING';
+      const isDuplicate = seen.has(movie.id);
+      if (isOngoing && !isDuplicate) {
+        seen.add(movie.id);
+        return true;
+      }
+      return false;
+    });
+
+    res.json({
+      status: true,
+      data: ongoingList
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.get('/v1/genre', async (req, res) => {
+  try {
+    const { id, page = 0 } = req.query;
+
+    if (id) {
+      let url = `${BASE_API}/explore/movie?page=${page}`;
+
+      if (Array.isArray(id)) {
+        id.forEach(val => { url += `&genre_in=${val}`; });
+      } else {
+        url += `&genre_in=${id}`;
+      }
+
+      const data = await proxyFetch(url);
+      return res.json({
+        status: true,
+        data: data.data?.movie ||[]
+      });
+    }
+
+    const data = await proxyFetch(`${BASE_API}/explore/genre`);
+    const genres = (data.data?.genre ||[]).map(({ id, name, group }) => ({
+      id,
+      name,
+      group
+    }));
+
+    res.json({
+      status: true,
+      data: genres
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.get('/v1/popular', async (req, res) => {
+  try {
+    const { page = 0 } = req.query;
+    const data = await proxyFetch(`${BASE_API}/explore/movie?sort=views&page=${page}`);
+    
+    res.json({
+      status: true,
+      data: data.data?.movie ||[]
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.get('/v1/search', async (req, res) => {
+  try {
+    const { q = '', page = 0 } = req.query;
+    const data = await proxyFetch(`${BASE_API}/explore/movie?keyword=${encodeURIComponent(q)}&page=${page}`);
+    
+    res.json({
+      status: true,
+      data: data.data?.movie ||[]
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.get('/v1/detail', async (req, res) => {
+  try {
+    const { id } = req.query;
+    if (!id) throw new Error("ID nya mana memek");
+
+    const detailRes = await proxyFetch(`${BASE_API}/movie/detail/${id}`);
+
+    let allEpisodes =[];
+    let page = 0;
+    let hasMore = true;
+
+    while (hasMore) {
+      const episodesRes = await proxyFetch(`${BASE_API}/movie/episode/${id}?page=${page}`);
+      const eps = episodesRes.data?.episode ||[];
+
+      if (eps.length > 0) {
+        allEpisodes = [...allEpisodes, ...eps];
+        page++;
+      } else {
+        hasMore = false;
+      }
+    }
+
+    res.json({
+      status: true,
+      data: {
+        ...detailRes.data?.movie,
+        episode_list: allEpisodes
+      }
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.get('/v1/episode', async (req, res) => {
+  try {
+    const { id } = req.query;
+    if (!id) throw new Error("ID episode nya mana memek");
+
+    const data = await proxyFetch(`${BASE_API}/episode/streamnew/${id}`);
+
+    res.json({
+      status: true,
+      data: {
+        episode: data.data?.episode || {},
+        server: data.data?.server ||[],
+        next_episode: data.data?.episode_next || null
+      }
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: false,
+      message: err.message
+    });
+  }
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    status: false,
+    message: "memek elaina wangyy"
+  });
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
+</file>
+
+</files>
