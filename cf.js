@@ -88,6 +88,18 @@ export function isCloudflareChallenge(statusCode, text = '') {
   return /just a moment|cf-chl|challenge-platform|cdn-cgi\/challenge|enable javascript and cookies|_cf_chl_opt/i.test(String(text));
 }
 
+// Header untuk path worker: hanya secret (+ passthrough opsional).
+// JANGAN menyertakan UA / Origin / Sec-Fetch-* / Sec-Ch-Ua di sini —
+// worker membangun profil browser-nya sendiri. Kalau header identitas itu
+// diteruskan mentah sampai ke origin, Cloudflare melihat inkonsistensi
+// (request cross-site dari non-browser yang mengklaim "same-origin") dan
+// menyajikan JS challenge "Just a moment..." (status 403).
+function workerHeaders(targetUrl, extra = {}) {
+  const headers = { 'X-Proxy-Secret': extra.secret || getProxySecret() };
+  if (extra.headers) Object.assign(headers, extra.headers);
+  return headers;
+}
+
 function browserHeaders(targetUrl, extra = {}) {
   const ua = pickUA();
   const urlObj = new URL(targetUrl);
@@ -157,12 +169,20 @@ export async function proxyFetch(targetUrl, opts = {}) {
 
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i];
-    const headers = browserHeaders(targetUrl, {
-      secret: opts.secret,
-      headers: opts.headers
-    });
+    let headers;
 
-    if (attempt.kind === 'direct') {
+    if (attempt.kind === 'worker') {
+      // Worker menerjemahkan request ini menjadi profil browser yang
+      // konsisten. Kita hanya mengirim secret, bukan header identitas.
+      headers = workerHeaders(targetUrl, {
+        secret: opts.secret,
+        headers: opts.headers
+      });
+    } else {
+      headers = browserHeaders(targetUrl, {
+        secret: opts.secret,
+        headers: opts.headers
+      });
       headers.Host = new URL(targetUrl).host;
     }
 
@@ -257,29 +277,34 @@ export async function proxyStream(targetUrl, incomingHeaders = {}) {
 
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i];
-    const ua = pickUA();
-    const urlObj = new URL(targetUrl);
+    let headersToSend;
 
-    const headersToSend = {
-      'User-Agent': ua.ua,
-      'Accept': incomingHeaders.accept || incomingHeaders['accept'] || '*/*',
-      'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Origin': 'https://animeinweb.com',
-      'Referer': 'https://animeinweb.com/',
-      'X-Requested-With': 'XMLHttpRequest',
-      'X-Proxy-Secret': getProxySecret(),
-      'Sec-Ch-Ua': ua.ch,
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': ua.pf,
-      'Sec-Fetch-Dest': 'video',
-      'Sec-Fetch-Mode': 'no-cors',
-      'Sec-Fetch-Site': 'cross-site',
-      'Connection': 'keep-alive'
-    };
-
-    if (attempt.kind === 'direct') {
-      headersToSend.Host = urlObj.host;
+    if (attempt.kind === 'worker') {
+      // Sama seperti proxyFetch: profil browser dibangun oleh worker,
+      // kita hanya mengirim secret + Range (butuh passthrough untuk
+      // seek/partial content video).
+      headersToSend = { 'X-Proxy-Secret': getProxySecret() };
+    } else {
+      const ua = pickUA();
+      headersToSend = {
+        'User-Agent': ua.ua,
+        'Accept': incomingHeaders.accept || incomingHeaders['accept'] || '*/*',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Origin': 'https://animeinweb.com',
+        'Referer': 'https://animeinweb.com/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Proxy-Secret': getProxySecret(),
+        'Sec-Ch-Ua': ua.ch,
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': ua.pf,
+        'Sec-Fetch-Dest': 'video',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Connection': 'keep-alive',
+        Host: new URL(targetUrl).host
+      };
     }
+
     if (incomingHeaders.range || incomingHeaders.Range) {
       headersToSend.Range = incomingHeaders.range || incomingHeaders.Range;
     }
