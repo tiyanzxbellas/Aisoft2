@@ -1,80 +1,43 @@
-# nefusoft-api
+# Aisoft2 API
 
-API Express yang dapat dijalankan lokal maupun dideploy ke Vercel.
+Express REST API yang mempertahankan rute `/v1/*` untuk frontend dan mengambil data anime langsung dari Jikan API v4. Request upstream dikirim langsung ke `BASE_API`; aplikasi tidak menggunakan worker atau layanan proxy. `CF_PROXY` dipertahankan sebagai variabel kompatibilitas, tetapi dikosongkan dan tidak dipakai.
 
-Semua request ke upstream **wajib** lewat `cf.js` (`proxyFetch` / `proxyStream`). File itu yang memasang header browser, `X-Proxy-Secret`, dan — kalau target di belakang Cloudflare — meneruskan request lewat CORS worker.
-
-## Kenapa 403 "Just a moment..."?
-
-`xyz-api.animein.net` diproteksi Cloudflare JS challenge. Request langsung dari IP datacenter (Vercel, dll) kena halaman *Just a moment...*. Header saja tidak cukup.
-
-`cf.js` menangani ini dengan urutan:
-
-1. Header dari `cf.js` (UA pool, `Origin`, `Referer`, `X-Proxy-Secret`, Sec-CH, ...)
-2. Untuk host `*.animein.net` / `*.animeinweb.com`, request **pertama** lewat CORS proxy:
-   `https://cf.tiyanstores.workers.dev/?url=<URL_TARGET>`
-3. Kalau worker gagal, baru coba langsung ke target
-
-Worker ini sudah terbukti tembus ke genre, popular, detail, episode, dan schedule.
-
-## Deploy ke Vercel
-
-1. Import repository ini ke Vercel, atau jalankan `vercel` dari root proyek.
-2. Tambahkan Environment Variable di **Project Settings → Environment Variables**:
-
-   ```text
-   BASE_API=https://xyz-api.animein.net/3/2
-   CF_PROXY=https://cf.tiyanstores.workers.dev/
-   ```
-
-   `CF_PROXY` opsional — default-nya sudah worker di atas. Jangan pakai `https://animeinweb.com/api/proxy/3/2` sebagai `BASE_API` (403: Direct API Proxy access is blocked).
-
-3. Deploy.
-
-`vercel.json` me-rewrite semua path ke `api/index.js` → `server.js`. Setiap route `/v1/*` memanggil `proxyFetch` / `proxyStream` dari `cf.js`.
-
-## Lokal
+## Menjalankan lokal
 
 ```bash
 npm install
+cp .env.example .env
 npm start
 ```
 
-Buat `.env`:
+Konfigurasi default:
 
-```text
-BASE_API=https://xyz-api.animein.net/3/2
-CF_PROXY=https://cf.tiyanstores.workers.dev/
+```env
+BASE_API=https://api.jikan.moe/v4
+CF_PROXY=
 PORT=3000
 ```
 
-## CORS video
-
-Pemutaran file di `storages.animein.net` juga lewat worker yang sama:
-
-```
-https://cf.tiyanstores.workers.dev/?url=<URL_VIDEO>
-```
-
-Atau lewat endpoint API:
-
-```
-/v1/proxy?url=<URL_VIDEO>
-```
+Tambahkan variabel yang sama pada konfigurasi environment deployment. Jangan menambahkan secret proxy.
 
 ## Endpoint
 
-- `/v1/schedule`
-- `/v1/genre`
-- `/v1/genre?id=`
-- `/v1/ongoing?page=`
-- `/v1/popular?page=`
-- `/v1/detail?id=`
-- `/v1/episode?id=`
-- `/v1/search?q=`
-- `/v1/health`
+Semua endpoint data menggunakan envelope `{ "status": true, "data": ... }` saat berhasil.
 
-## Catatan
+- `GET /v1/health` — cek akses Jikan.
+- `GET /v1/genre` — daftar genre anime.
+- `GET /v1/genre?id=14&page=0` — anime berdasarkan MAL genre ID.
+- `GET /v1/popular?page=0` — anime populer.
+- `GET /v1/search?q=naruto&page=0` — pencarian anime.
+- `GET /v1/schedule` — jadwal untuk Senin–Minggu dan daftar acak.
+- `GET /v1/ongoing` — anime yang sedang tayang pada musim sekarang.
+- `GET /v1/detail?id=20` — detail anime dan daftar episode halaman pertama.
+- `GET /v1/episode?id=20` — metadata trailer YouTube anime; Jikan tidak menyediakan video episode atau MP4.
 
-- Jangan menyimpan token atau secret deployment di `.env` yang dikomit. Konfigurasi environment production harus disimpan di dashboard Vercel.
-- Endpoint `/v1/proxy` meneruskan stream respons upstream. Batas durasi function pada `vercel.json` adalah 60 detik; video atau download panjang dapat terhenti karena batas platform Vercel.
+Parameter `page` untuk frontend dimulai dari `0`; API mengubahnya menjadi halaman Jikan yang dimulai dari `1`. Respons koleksi menggunakan model movie yang konsisten (`id`, `title`, `poster`, `genres`, `score`, dan field terkait). Jadwal mempertahankan key hari berhuruf kapital yang digunakan frontend lama.
+
+`/v1/episode` menerima MAL anime ID. Bila Jikan menyediakan `trailer.youtube_id`, respons menyertakan URL tonton dan embed YouTube pada struktur `data.episode` / `data.server`; bila trailer tidak tersedia, `server` berupa array kosong. Endpoint ini tidak mem-proxy atau mengembalikan stream video.
+
+## Deploy ke Vercel
+
+Import repository ini ke Vercel lalu deploy. `vercel.json` meneruskan semua path ke `api/index.js`, yang menggunakan Express app yang sama dengan mode lokal. Atur `BASE_API=https://api.jikan.moe/v4` dan `PORT` bila diperlukan. Biarkan `CF_PROXY` kosong.

@@ -1,10 +1,10 @@
-This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+This file is a merged representation of the current codebase, generated from the source files below.
 
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of the entire repository's contents.
+This file contains a packed representation of selected repository files.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -12,42 +12,38 @@ or other automated processes.
 <file_format>
 The content is organized as follows:
 1. This summary section
-2. Repository information
-3. Directory structure
-4. Repository files (if enabled)
-5. Multiple file entries, each consisting of:
-  - File path as an attribute
-  - Full contents of the file
+2. Directory structure
+3. Repository files
 </file_format>
 
 <usage_guidelines>
-- This file should be treated as read-only. Any changes should be made to the
-  original repository files, not this packed version.
-- When processing this file, use the file path to distinguish
-  between different files in the repository.
-- Be aware that this file may contain sensitive information. Handle it with
-  the same level of security as you would the original repository.
+- Treat this file as a generated snapshot. Make changes to the original repository files,
+  then regenerate this snapshot if it needs to stay current.
+- Files matching .gitignore rules, including the local .env, are not included.
 </usage_guidelines>
-
-<notes>
-- Some files may have been excluded based on .gitignore rules and Repomix's configuration
-- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
-- Files matching patterns in .gitignore are excluded
-- Files matching default ignore patterns are excluded
-- Files are sorted by Git change count (files with more changes are at the bottom)
-</notes>
 
 </file_summary>
 
 <directory_structure>
+.env.example
 .gitignore
+README.md
+api/index.js
 cf.js
 package.json
 server.js
+test/jikan-api.test.js
+vercel.json
 </directory_structure>
 
 <files>
-This section contains the contents of the repository's files.
+This section contains the contents of the selected repository files.
+
+<file path=".env.example">
+BASE_API=https://api.jikan.moe/v4
+CF_PROXY=
+PORT=3000
+</file>
 
 <file path=".gitignore">
 node_modules
@@ -55,14 +51,190 @@ node_modules
 package-lock.json
 </file>
 
+<file path="README.md">
+# Aisoft2 API
+
+Express REST API yang mempertahankan rute `/v1/*` untuk frontend dan mengambil data anime langsung dari Jikan API v4. Request upstream dikirim langsung ke `BASE_API`; aplikasi tidak menggunakan worker atau layanan proxy. `CF_PROXY` dipertahankan sebagai variabel kompatibilitas, tetapi dikosongkan dan tidak dipakai.
+
+## Menjalankan lokal
+
+```bash
+npm install
+cp .env.example .env
+npm start
+```
+
+Konfigurasi default:
+
+```env
+BASE_API=https://api.jikan.moe/v4
+CF_PROXY=
+PORT=3000
+```
+
+Tambahkan variabel yang sama pada konfigurasi environment deployment. Jangan menambahkan secret proxy.
+
+## Endpoint
+
+Semua endpoint data menggunakan envelope `{ "status": true, "data": ... }` saat berhasil.
+
+- `GET /v1/health` — cek akses Jikan.
+- `GET /v1/genre` — daftar genre anime.
+- `GET /v1/genre?id=14&page=0` — anime berdasarkan MAL genre ID.
+- `GET /v1/popular?page=0` — anime populer.
+- `GET /v1/search?q=naruto&page=0` — pencarian anime.
+- `GET /v1/schedule` — jadwal untuk Senin–Minggu dan daftar acak.
+- `GET /v1/ongoing` — anime yang sedang tayang pada musim sekarang.
+- `GET /v1/detail?id=20` — detail anime dan daftar episode halaman pertama.
+- `GET /v1/episode?id=20` — metadata trailer YouTube anime; Jikan tidak menyediakan video episode atau MP4.
+
+Parameter `page` untuk frontend dimulai dari `0`; API mengubahnya menjadi halaman Jikan yang dimulai dari `1`. Respons koleksi menggunakan model movie yang konsisten (`id`, `title`, `poster`, `genres`, `score`, dan field terkait). Jadwal mempertahankan key hari berhuruf kapital yang digunakan frontend lama.
+
+`/v1/episode` menerima MAL anime ID. Bila Jikan menyediakan `trailer.youtube_id`, respons menyertakan URL tonton dan embed YouTube pada struktur `data.episode` / `data.server`; bila trailer tidak tersedia, `server` berupa array kosong. Endpoint ini tidak mem-proxy atau mengembalikan stream video.
+
+## Deploy ke Vercel
+
+Import repository ini ke Vercel lalu deploy. `vercel.json` meneruskan semua path ke `api/index.js`, yang menggunakan Express app yang sama dengan mode lokal. Atur `BASE_API=https://api.jikan.moe/v4` dan `PORT` bila diperlukan. Biarkan `CF_PROXY` kosong.
+</file>
+
+<file path="api/index.js">
+// Entry point Vercel. Uses the same Express app and direct Jikan client as local mode.
+import app from '../server.js';
+
+export default app;
+</file>
+
+<file path="cf.js">
+// Direct JSON client for the Jikan API. Requests are sent to their target URL
+// without a worker, proxy, browser-origin headers, or proxy credentials.
+import { request } from 'undici';
+
+const MAX_REQUESTS_PER_SECOND = 3;
+const MAX_REQUESTS_PER_MINUTE = 60;
+const RATE_WINDOW_MS = 60_000;
+const MIN_REQUEST_INTERVAL_MS = Math.ceil(1000 / MAX_REQUESTS_PER_SECOND);
+const MAX_RETRIES = 2;
+
+const requestStartTimes = [];
+let lastRequestStartedAt = 0;
+let rateLimitQueue = Promise.resolve();
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Serialize request starts so concurrent routes respect Jikan's published
+// per-second and per-minute limits within this Node process.
+function acquireRequestSlot() {
+  const slot = rateLimitQueue.then(async () => {
+    while (true) {
+      const now = Date.now();
+      while (requestStartTimes.length && now - requestStartTimes[0] >= RATE_WINDOW_MS) {
+        requestStartTimes.shift();
+      }
+
+      const perSecondDelay = Math.max(0, lastRequestStartedAt + MIN_REQUEST_INTERVAL_MS - now);
+      const perMinuteDelay = requestStartTimes.length >= MAX_REQUESTS_PER_MINUTE
+        ? Math.max(0, requestStartTimes[0] + RATE_WINDOW_MS - now)
+        : 0;
+      const waitMs = Math.max(perSecondDelay, perMinuteDelay);
+
+      if (waitMs === 0) {
+        const startedAt = Date.now();
+        requestStartTimes.push(startedAt);
+        lastRequestStartedAt = startedAt;
+        return;
+      }
+
+      await sleep(waitMs);
+    }
+  });
+
+  rateLimitQueue = slot.catch(() => {});
+  return slot;
+}
+
+function retryDelay(headers, attempt, statusCode) {
+  const retryAfter = headers?.['retry-after'];
+  if (retryAfter !== undefined) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, Math.min(60_000, seconds * 1000));
+
+    const retryAt = Date.parse(retryAfter);
+    if (Number.isFinite(retryAt)) return Math.max(0, Math.min(60_000, retryAt - Date.now()));
+  }
+
+  return statusCode === 429 ? 1000 : Math.min(4000, 500 * (2 ** attempt));
+}
+
+function httpError(statusCode, text) {
+  const snippet = String(text || '').replace(/\s+/g, ' ').slice(0, 240);
+  const error = new Error(`Jikan returned ${statusCode}${snippet ? `: ${snippet}` : ''}`);
+  error.statusCode = statusCode;
+  return error;
+}
+
+/** Fetch and parse a JSON response directly from an HTTPS API URL. */
+export async function fetchJson(targetUrl, options = {}) {
+  const url = new URL(targetUrl);
+  if (url.protocol !== 'https:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') {
+    throw new Error('Upstream API URLs must use HTTPS');
+  }
+
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    await acquireRequestSlot();
+
+    try {
+      const { statusCode, headers, body } = await request(url, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          'user-agent': 'Aisoft2 Jikan API client',
+          ...options.headers
+        },
+        headersTimeout: 10_000,
+        bodyTimeout: 20_000
+      });
+      const text = await body.text();
+
+      if (statusCode < 200 || statusCode >= 300) {
+        const error = httpError(statusCode, text);
+        lastError = error;
+        const retryable = statusCode === 429 || statusCode >= 500;
+        if (!retryable || attempt === MAX_RETRIES) throw error;
+        await sleep(retryDelay(headers, attempt, statusCode));
+        continue;
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new Error('Jikan returned an invalid JSON response');
+      }
+    } catch (error) {
+      lastError = error;
+      const statusCode = Number(error.statusCode);
+      const retryable = !statusCode || statusCode === 429 || statusCode >= 500;
+      if (!retryable || attempt === MAX_RETRIES) throw error;
+
+      // HTTP errors have already waited according to Retry-After above.
+      if (!statusCode) await sleep(Math.min(4000, 500 * (2 ** attempt)));
+    }
+  }
+
+  throw lastError || new Error('Jikan request failed');
+}
+</file>
+
 <file path="package.json">
 {
   "name": "nefusoft-api",
   "version": "1.0.0",
-  "main": "cf.js",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test",
     "start": "node server.js"
   },
   "keywords": [],
@@ -77,296 +249,574 @@ package-lock.json
 }
 </file>
 
-<file path="cf.js">
-import { request, Agent, setGlobalDispatcher } from 'undici';
-
-const UA_POOL =[
-  {
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    ch: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    pf: '"Windows"'
-  },
-  {
-    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    ch: '"Chromium";v="121", "Not(A:Brand";v="24", "Google Chrome";v="121"',
-    pf: '"macOS"'
-  },
-  {
-    ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    ch: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    pf: '"Linux"'
-  }
-];
-
-const agent = new Agent({
-  connect: { rejectUnauthorized: false },
-  allowH2: true,
-  maxRedirections: 5,
-  keepAliveTimeout: 15000,
-});
-
-setGlobalDispatcher(agent);
-
-export async function proxyFetch(targetUrl) {
-  const id = UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
-  const urlObj = new URL(targetUrl);
-  const originUrl = `${urlObj.protocol}//${urlObj.host}`;
-
-  try {
-    const { statusCode, body } = await request(targetUrl, {
-      method: 'GET',
-      headers: {
-        'Host': urlObj.host,
-        'User-Agent': id.ua,
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Origin': originUrl,
-        'Referer': `${originUrl}/`,
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-Proxy-Secret': 'animein-secure-proxy-key-123',
-        'Sec-Ch-Ua': id.ch,
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': id.pf,
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-        'Connection': 'keep-alive'
-      },
-    });
-
-    if (statusCode !== 200) {
-        throw new Error(`Target returned status ${statusCode}`);
-    }
-
-    const text = await body.text();
-    return JSON.parse(text);
-  } catch (err) {
-    throw err;
-  }
-}
-</file>
-
 <file path="server.js">
 import express from 'express';
 import dotenv from 'dotenv';
-import { proxyFetch } from './cf.js';
+import { fetchJson } from './cf.js';
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BASE_API = process.env.BASE_API;
+const BASE_API = (process.env.BASE_API || 'https://api.jikan.moe/v4').replace(/\/+$/, '');
+const SCHEDULE_DAYS = ['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU', 'RANDOM'];
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+function jikanUrl(path, params = {}) {
+  const url = new URL(path.replace(/^\/+/, ''), `${BASE_API}/`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url.toString();
+}
+
+function jikanPage(legacyPage = 0) {
+  const page = Number(legacyPage);
+  return Number.isSafeInteger(page) && page >= 0 ? page + 1 : 1;
+}
+
+function parseAnimeId(value) {
+  const id = String(value ?? '');
+  if (!/^\d+$/.test(id) || Number(id) < 1 || !Number.isSafeInteger(Number(id))) return null;
+  return Number(id);
+}
+
+// Cache keeps popular, genre, and schedule reads from consuming Jikan's quota.
+const cache = new Map();
+function setCache(key, data, ttlMs = 5 * 60 * 1000) {
+  cache.set(key, { data, expiresAt: Date.now() + ttlMs });
+}
+function getCache(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function jikanToMovie(anime) {
+  const animeStatus = String(anime.status || '').toLowerCase();
+  return {
+    id: anime.mal_id == null ? '' : String(anime.mal_id),
+    mal_id: anime.mal_id,
+    title: anime.title,
+    title_english: anime.title_english,
+    title_japanese: anime.title_japanese,
+    poster: anime.images?.jpg?.large_image_url || anime.images?.jpg?.image_url,
+    image: anime.images?.jpg?.large_image_url || anime.images?.jpg?.image_url,
+    type: anime.type,
+    status: animeStatus.includes('finished') || animeStatus.includes('completed') ? 'COMPLETED' : 'ONGOING',
+    score: anime.score,
+    synopsis: anime.synopsis,
+    year: anime.year || anime.aired?.prop?.from?.year,
+    genres: (anime.genres || []).map(genre => genre.name),
+    genre_ids: (anime.genres || []).map(genre => genre.mal_id),
+    episodes: anime.episodes,
+    aired: anime.aired,
+    source: 'jikan'
+  };
+}
+
+async function jikanSearch(query, page = 0) {
+  const q = String(query || '').trim();
+  if (!q) return [];
+  const json = await fetchJson(jikanUrl('anime', {
+    q,
+    page: jikanPage(page),
+    sfw: 'true',
+    order_by: 'popularity',
+    sort: 'desc'
+  }));
+  return (Array.isArray(json.data) ? json.data : []).map(jikanToMovie);
+}
+
+async function jikanPopular(page = 0) {
+  const json = await fetchJson(jikanUrl('top/anime', {
+    page: jikanPage(page),
+    sfw: 'true'
+  }));
+  return (Array.isArray(json.data) ? json.data : []).map(jikanToMovie);
+}
+
+async function jikanByGenre(genreId, page = 0) {
+  const requestedIds = Array.isArray(genreId) ? genreId : String(genreId ?? '').split(',');
+  const ids = requestedIds
+    .flatMap(value => String(value).split(','))
+    .map(value => value.trim())
+    .filter(value => /^\d+$/.test(value));
+  if (!ids.length) throw new Error('Genre id must be a numeric Jikan genre id');
+
+  const json = await fetchJson(jikanUrl('anime', {
+    genres: ids.join(','),
+    page: jikanPage(page),
+    order_by: 'popularity',
+    sort: 'desc',
+    sfw: 'true'
+  }));
+  return (Array.isArray(json.data) ? json.data : []).map(jikanToMovie);
+}
+
+async function jikanSchedule(day) {
+  const dayFilters = {
+    SENIN: 'monday',
+    SELASA: 'tuesday',
+    RABU: 'wednesday',
+    KAMIS: 'thursday',
+    JUMAT: 'friday',
+    SABTU: 'saturday',
+    MINGGU: 'sunday'
+  };
+  const normalizedDay = String(day || '').toUpperCase();
+
+  if (normalizedDay === 'RANDOM') {
+    const json = await fetchJson(jikanUrl('random/anime', { sfw: 'true' }));
+    return json.data ? [jikanToMovie(json.data)] : [];
+  }
+
+  const params = { sfw: 'true' };
+  if (dayFilters[normalizedDay]) params.filter = dayFilters[normalizedDay];
+  const json = await fetchJson(jikanUrl('schedules', params));
+  return (Array.isArray(json.data) ? json.data : []).map(jikanToMovie).slice(0, 25);
+}
+
+function jikanGenreGroup(genre) {
+  const name = String(genre.name || '');
+  if (['Shounen', 'Shoujo', 'Seinen', 'Josei', 'Kids'].includes(name)) return 'Demographic';
+  if (['Ecchi', 'Hentai', 'Erotica'].includes(name)) return 'Explicit';
+  return 'Genre';
+}
+
+function sendUpstreamFailure(res, error) {
+  return res.json({ status: true, data: [], error: error.message });
+}
 
 app.get('/', (req, res) => {
   res.json({
     status: true,
-    message: "MEMEKKK"
+    message: 'Aisoft API is running',
+    endpoints: [
+      '/v1/genre',
+      '/v1/genre?id=1&page=0',
+      '/v1/popular?page=0',
+      '/v1/search?q=naruto&page=0',
+      '/v1/schedule',
+      '/v1/ongoing',
+      '/v1/detail?id=20',
+      '/v1/episode?id=20',
+      '/v1/health'
+    ]
+  });
+});
+
+app.get('/v1/health', async (req, res) => {
+  const checks = {};
+  try {
+    const json = await fetchJson(jikanUrl('genres/anime'));
+    const count = Array.isArray(json.data) ? json.data.length : 0;
+    checks.upstream = { ok: true, genre_count: count, keys: Object.keys(json).slice(0, 5) };
+    checks.jikan = { ok: true, count };
+  } catch (error) {
+    checks.upstream = { ok: false, error: error.message, status: error.statusCode || null };
+    checks.jikan = { ok: false, error: error.message };
+  }
+
+  res.json({
+    status: true,
+    base_api: BASE_API,
+    cf_proxy: '',
+    checks,
+    fallback_genres_count: 0
   });
 });
 
 app.get('/v1/schedule', async (req, res) => {
-  try {
-    const days =['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU', 'RANDOM'];
-    
-    const results = await Promise.all(
-      days.map(day => proxyFetch(`${BASE_API}/schedule/data?day=${day}`))
-    );
+  const cacheKey = 'schedule';
+  const cached = getCache(cacheKey);
+  if (cached !== null) return res.json({ status: true, data: cached, cached: true });
 
-    const scheduleData = {};
-    days.forEach((day, index) => {
-      scheduleData[day] = results[index]?.data?.movie ||[];
-    });
+  const scheduleData = Object.fromEntries(SCHEDULE_DAYS.map(day => [day, []]));
+  const errors = [];
+  await Promise.all(SCHEDULE_DAYS.map(async day => {
+    try {
+      scheduleData[day] = await jikanSchedule(day);
+    } catch (error) {
+      errors.push(error);
+      console.warn(`Jikan schedule request failed for ${day}:`, error.message);
+    }
+  }));
 
-    res.json({
-      status: true,
-      data: scheduleData
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
-  }
+  setCache(cacheKey, scheduleData, errors.length ? 30_000 : 5 * 60 * 1000);
+  return res.json({ status: true, data: scheduleData });
 });
 
 app.get('/v1/ongoing', async (req, res) => {
+  const cacheKey = 'ongoing';
+  const cached = getCache(cacheKey);
+  if (cached !== null) return res.json({ status: true, data: cached, cached: true });
+
   try {
-    const days =['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU', 'RANDOM'];
-    
-    const results = await Promise.all(
-      days.map(day => proxyFetch(`${BASE_API}/schedule/data?day=${day}`))
-    );
-
-    const allMovies = results.flatMap(r => r?.data?.movie ||[]);
-    
-    const seen = new Set();
-    const ongoingList = allMovies.filter(movie => {
-      const isOngoing = movie.status === 'ONGOING';
-      const isDuplicate = seen.has(movie.id);
-      if (isOngoing && !isDuplicate) {
-        seen.add(movie.id);
-        return true;
-      }
-      return false;
-    });
-
-    res.json({
-      status: true,
-      data: ongoingList
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
+    const json = await fetchJson(jikanUrl('seasons/now', { sfw: 'true', filter: 'tv' }));
+    const list = (Array.isArray(json.data) ? json.data : [])
+      .map(jikanToMovie)
+      .filter(movie => movie.status === 'ONGOING');
+    setCache(cacheKey, list, 5 * 60 * 1000);
+    return res.json({ status: true, data: list });
+  } catch (error) {
+    console.warn('Jikan ongoing request failed:', error.message);
+    return sendUpstreamFailure(res, error);
   }
 });
 
 app.get('/v1/genre', async (req, res) => {
-  try {
-    const { id, page = 0 } = req.query;
+  const { id, page = 0 } = req.query;
+  const hasGenreFilter = id !== undefined && String(id).trim() !== '';
 
-    if (id) {
-      let url = `${BASE_API}/explore/movie?page=${page}`;
+  if (hasGenreFilter) {
+    const ids = Array.isArray(id) ? id.join(',') : String(id);
+    const cacheKey = `genre_${ids}_${page}`;
+    const cached = getCache(cacheKey);
+    if (cached !== null) return res.json({ status: true, data: cached, cached: true });
 
-      if (Array.isArray(id)) {
-        id.forEach(val => { url += `&genre_in=${val}`; });
-      } else {
-        url += `&genre_in=${id}`;
-      }
-
-      const data = await proxyFetch(url);
-      return res.json({
-        status: true,
-        data: data.data?.movie ||[]
-      });
+    try {
+      const movies = await jikanByGenre(id, page);
+      setCache(cacheKey, movies, 5 * 60 * 1000);
+      return res.json({ status: true, data: movies });
+    } catch (error) {
+      console.warn(`Jikan genre request failed for id=${ids}:`, error.message);
+      return sendUpstreamFailure(res, error);
     }
+  }
 
-    const data = await proxyFetch(`${BASE_API}/explore/genre`);
-    const genres = (data.data?.genre ||[]).map(({ id, name, group }) => ({
-      id,
-      name,
-      group
+  const cached = getCache('genre_list');
+  if (cached !== null) return res.json({ status: true, data: cached, cached: true });
+
+  try {
+    const json = await fetchJson(jikanUrl('genres/anime'));
+    const genres = (Array.isArray(json.data) ? json.data : []).map(genre => ({
+      id: genre.mal_id,
+      name: genre.name,
+      group: jikanGenreGroup(genre)
     }));
-
-    res.json({
-      status: true,
-      data: genres
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
+    setCache('genre_list', genres, 30 * 60 * 1000);
+    return res.json({ status: true, data: genres });
+  } catch (error) {
+    console.warn('Jikan genre list request failed:', error.message);
+    return sendUpstreamFailure(res, error);
   }
 });
 
 app.get('/v1/popular', async (req, res) => {
+  const { page = 0 } = req.query;
+  const cacheKey = `popular_${page}`;
+  const cached = getCache(cacheKey);
+  if (cached !== null) return res.json({ status: true, data: cached, cached: true });
+
   try {
-    const { page = 0 } = req.query;
-    const data = await proxyFetch(`${BASE_API}/explore/movie?sort=views&page=${page}`);
-    
-    res.json({
-      status: true,
-      data: data.data?.movie ||[]
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
+    const movies = await jikanPopular(page);
+    setCache(cacheKey, movies, 5 * 60 * 1000);
+    return res.json({ status: true, data: movies });
+  } catch (error) {
+    console.warn('Jikan popular request failed:', error.message);
+    return sendUpstreamFailure(res, error);
   }
 });
 
 app.get('/v1/search', async (req, res) => {
+  const { q = '', page = 0 } = req.query;
+  const query = String(q).trim();
+  if (!query) return res.json({ status: true, data: [] });
+
+  const cacheKey = `search_${query}_${page}`;
+  const cached = getCache(cacheKey);
+  if (cached !== null) return res.json({ status: true, data: cached, cached: true });
+
   try {
-    const { q = '', page = 0 } = req.query;
-    const data = await proxyFetch(`${BASE_API}/explore/movie?keyword=${encodeURIComponent(q)}&page=${page}`);
-    
-    res.json({
-      status: true,
-      data: data.data?.movie ||[]
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
+    const movies = await jikanSearch(query, page);
+    setCache(cacheKey, movies, 5 * 60 * 1000);
+    return res.json({ status: true, data: movies });
+  } catch (error) {
+    console.warn('Jikan search request failed:', error.message);
+    return sendUpstreamFailure(res, error);
   }
 });
 
 app.get('/v1/detail', async (req, res) => {
+  const id = parseAnimeId(req.query.id);
+  if (id === null) {
+    return res.status(400).json({ status: false, message: 'A numeric Jikan anime id is required' });
+  }
+
+  const cacheKey = `detail_${id}`;
+  const cached = getCache(cacheKey);
+  if (cached !== null) return res.json({ status: true, data: cached, cached: true });
+
   try {
-    const { id } = req.query;
-    if (!id) throw new Error("ID nya mana memek");
+    const [detailResult, episodesResult] = await Promise.allSettled([
+      fetchJson(jikanUrl(`anime/${id}/full`)),
+      fetchJson(jikanUrl(`anime/${id}/episodes`, { page: 1 }))
+    ]);
 
-    const detailRes = await proxyFetch(`${BASE_API}/movie/detail/${id}`);
+    if (detailResult.status === 'rejected') throw detailResult.reason;
+    const anime = detailResult.value.data;
+    if (!anime) throw new Error('Jikan returned no anime detail');
 
-    let allEpisodes =[];
-    let page = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      const episodesRes = await proxyFetch(`${BASE_API}/movie/episode/${id}?page=${page}`);
-      const eps = episodesRes.data?.episode ||[];
-
-      if (eps.length > 0) {
-        allEpisodes = [...allEpisodes, ...eps];
-        page++;
-      } else {
-        hasMore = false;
-      }
+    let episodeList = [];
+    if (episodesResult.status === 'fulfilled') {
+      episodeList = Array.isArray(episodesResult.value.data)
+        ? episodesResult.value.data.map(episode => ({ ...episode, id: episode.mal_id }))
+        : [];
+    } else {
+      console.warn(`Jikan episode list request failed for anime ${id}:`, episodesResult.reason.message);
     }
 
-    res.json({
-      status: true,
-      data: {
-        ...detailRes.data?.movie,
-        episode_list: allEpisodes
-      }
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
+    const detail = {
+      ...jikanToMovie(anime),
+      id: anime.mal_id,
+      status: anime.status,
+      episode_list: episodeList,
+      trailer: anime.trailer || null,
+      url: anime.url
+    };
+    setCache(cacheKey, detail, 10 * 60 * 1000);
+    return res.json({ status: true, data: detail });
+  } catch (error) {
+    console.warn(`Jikan detail request failed for anime ${id}:`, error.message);
+    return res.status(error.statusCode === 404 ? 404 : 502).json({ status: false, message: error.message });
   }
 });
 
 app.get('/v1/episode', async (req, res) => {
+  const id = parseAnimeId(req.query.id);
+  if (id === null) {
+    return res.status(400).json({ status: false, message: 'A numeric Jikan anime id is required' });
+  }
+
   try {
-    const { id } = req.query;
-    if (!id) throw new Error("ID episode nya mana memek");
+    const json = await fetchJson(jikanUrl(`anime/${id}/full`));
+    const anime = json.data;
+    if (!anime) throw new Error('Jikan returned no anime detail');
 
-    const data = await proxyFetch(`${BASE_API}/episode/streamnew/${id}`);
+    const youtubeId = anime.trailer?.youtube_id || null;
+    const encodedYoutubeId = youtubeId ? encodeURIComponent(youtubeId) : null;
+    const watchUrl = encodedYoutubeId ? `https://www.youtube.com/watch?v=${encodedYoutubeId}` : null;
+    const embedUrl = encodedYoutubeId ? `https://www.youtube.com/embed/${encodedYoutubeId}` : null;
 
-    res.json({
+    return res.json({
       status: true,
       data: {
-        episode: data.data?.episode || {},
-        server: data.data?.server ||[],
-        next_episode: data.data?.episode_next || null
+        episode: {
+          id: anime.mal_id,
+          title: anime.title,
+          title_english: anime.title_english,
+          youtube_id: youtubeId,
+          trailer: youtubeId ? { youtube_id: youtubeId, url: watchUrl, embed_url: embedUrl } : null
+        },
+        server: youtubeId ? [{
+          name: 'YouTube',
+          server: 'YouTube',
+          url: embedUrl,
+          link: watchUrl,
+          embed_url: embedUrl,
+          youtube_id: youtubeId,
+          type: 'trailer'
+        }] : [],
+        next_episode: null
       }
     });
-  } catch (err) {
-    res.status(500).json({
-      status: false,
-      message: err.message
-    });
+  } catch (error) {
+    console.warn(`Jikan trailer request failed for anime ${id}:`, error.message);
+    return res.status(error.statusCode === 404 ? 404 : 502).json({ status: false, message: error.message });
   }
 });
 
 app.use((req, res) => {
   res.status(404).json({
     status: false,
-    message: "memek elaina wangyy"
+    message: 'Endpoint not found',
+    available: ['/v1/genre', '/v1/popular', '/v1/search', '/v1/schedule', '/v1/ongoing', '/v1/detail', '/v1/episode', '/v1/health']
   });
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+
+export default app;
+</file>
+
+<file path="test/jikan-api.test.js">
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { after, before, test } from 'node:test';
+
+const anime = {
+  mal_id: 20,
+  title: 'Naruto',
+  title_english: 'Naruto',
+  title_japanese: 'ナルト',
+  images: { jpg: { large_image_url: 'https://images.example/naruto.jpg' } },
+  type: 'TV',
+  status: 'Currently Airing',
+  score: 8.1,
+  synopsis: 'A ninja story.',
+  year: 2002,
+  episodes: 220,
+  genres: [{ mal_id: 1, name: 'Action' }],
+  aired: { prop: { from: { year: 2002 } } },
+  trailer: { youtube_id: 'abc123xyz01' },
+  url: 'https://myanimelist.net/anime/20/Naruto'
+};
+
+const requests = [];
+let jikanServer;
+let appServer;
+let apiOrigin;
+
+function respond(res, body, statusCode = 200) {
+  res.writeHead(statusCode, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+before(async () => {
+  jikanServer = createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    requests.push(url);
+
+    if (url.pathname === '/v4/genres/anime') {
+      return respond(res, { data: [{ mal_id: 1, name: 'Action' }] });
+    }
+    if (url.pathname === '/v4/top/anime') {
+      return respond(res, { data: [anime] });
+    }
+    if (url.pathname === '/v4/anime' || url.pathname === '/v4/anime/') {
+      return respond(res, { data: [anime] });
+    }
+    if (url.pathname === '/v4/schedules') {
+      return respond(res, { data: [anime] });
+    }
+    if (url.pathname === '/v4/random/anime') {
+      return respond(res, { data: anime });
+    }
+    if (url.pathname === '/v4/seasons/now') {
+      return respond(res, { data: [anime] });
+    }
+    if (url.pathname === '/v4/anime/20/full') {
+      return respond(res, { data: anime });
+    }
+    if (url.pathname === '/v4/anime/20/episodes') {
+      return respond(res, { data: [{ mal_id: 1, title: 'Enter: Naruto Uzumaki!' }] });
+    }
+    return respond(res, { message: `Unexpected upstream route: ${url.pathname}` }, 404);
+  });
+  jikanServer.listen(0, '127.0.0.1');
+  await new Promise(resolve => jikanServer.once('listening', resolve));
+  const upstreamPort = jikanServer.address().port;
+
+  process.env.BASE_API = `http://127.0.0.1:${upstreamPort}/v4`;
+  process.env.VERCEL = '1';
+  const { default: app } = await import('../server.js');
+  appServer = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => appServer.once('listening', resolve));
+  apiOrigin = `http://127.0.0.1:${appServer.address().port}`;
 });
+
+after(async () => {
+  for (const server of [appServer, jikanServer]) {
+    if (!server?.listening) continue;
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('legacy v1 routes are backed directly by Jikan and keep their response envelope', async () => {
+  const healthResponse = await fetch(`${apiOrigin}/v1/health`);
+  const health = await healthResponse.json();
+  assert.equal(health.status, true);
+  assert.equal(health.cf_proxy, '');
+  assert.equal(health.checks.jikan.ok, true);
+
+  const genres = await (await fetch(`${apiOrigin}/v1/genre`)).json();
+  assert.deepEqual(genres.data, [{ id: 1, name: 'Action', group: 'Genre' }]);
+
+  const byGenre = await (await fetch(`${apiOrigin}/v1/genre?id=14&page=0`)).json();
+  assert.equal(byGenre.status, true);
+  assert.equal(byGenre.data[0].id, '20');
+
+  const popular = await (await fetch(`${apiOrigin}/v1/popular?page=0`)).json();
+  assert.equal(popular.status, true);
+  assert.equal(popular.data[0].title, 'Naruto');
+
+  const search = await (await fetch(`${apiOrigin}/v1/search?q=naruto&page=0`)).json();
+  assert.equal(search.status, true);
+  assert.equal(search.data[0].poster, 'https://images.example/naruto.jpg');
+
+  const schedule = await (await fetch(`${apiOrigin}/v1/schedule`)).json();
+  assert.deepEqual(Object.keys(schedule.data), ['SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU', 'MINGGU', 'RANDOM']);
+  assert.equal(schedule.data.SENIN[0].title, 'Naruto');
+  assert.equal(schedule.data.RANDOM[0].title, 'Naruto');
+
+  const ongoing = await (await fetch(`${apiOrigin}/v1/ongoing`)).json();
+  assert.equal(ongoing.status, true);
+  assert.equal(ongoing.data[0].status, 'ONGOING');
+
+  const detail = await (await fetch(`${apiOrigin}/v1/detail?id=20`)).json();
+  assert.equal(detail.status, true);
+  assert.equal(detail.data.id, 20);
+  assert.equal(detail.data.episode_list[0].title, 'Enter: Naruto Uzumaki!');
+
+  const episode = await (await fetch(`${apiOrigin}/v1/episode?id=20`)).json();
+  assert.equal(episode.status, true);
+  assert.equal(episode.data.episode.youtube_id, 'abc123xyz01');
+  assert.equal(episode.data.server[0].type, 'trailer');
+  assert.equal(episode.data.next_episode, null);
+
+  const popularRequest = requests.find(url => url.pathname === '/v4/top/anime');
+  const genreRequest = requests.find(url => url.pathname === '/v4/anime' && url.searchParams.has('genres'));
+  const searchRequest = requests.find(url => url.pathname === '/v4/anime' && url.searchParams.has('q'));
+  const scheduleRequest = requests.find(url => url.pathname === '/v4/schedules');
+  const ongoingRequest = requests.find(url => url.pathname === '/v4/seasons/now');
+  const episodeListRequest = requests.find(url => url.pathname === '/v4/anime/20/episodes');
+
+  assert.equal(popularRequest.searchParams.get('page'), '1');
+  assert.equal(genreRequest.searchParams.get('page'), '1');
+  assert.equal(genreRequest.searchParams.get('genres'), '14');
+  assert.equal(searchRequest.searchParams.get('page'), '1');
+  assert.equal(searchRequest.searchParams.get('q'), 'naruto');
+  assert.equal(scheduleRequest.searchParams.get('filter'), 'monday');
+  assert.equal(ongoingRequest.searchParams.get('filter'), 'tv');
+  assert.equal(episodeListRequest.searchParams.get('page'), '1');
+  assert.ok(requests.every(url => url.origin === `http://127.0.0.1:${jikanServer.address().port}`));
+});
+</file>
+
+<file path="vercel.json">
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
+  ],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    }
+  }
+}
 </file>
 
 </files>
