@@ -1,5 +1,4 @@
-// Entry point Vercel. Seluruh route diteruskan ke Express app yang sama
-// dengan mode lokal; setiap request keluar ke upstream tetap memakai cf.js.
+// Entry point Vercel. Uses the same Express app and direct Jikan client as local mode.
 import app from '../server.js';
 
 export default app;
