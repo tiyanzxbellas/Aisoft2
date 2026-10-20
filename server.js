@@ -729,7 +729,9 @@ app.get(['/v1/proxy', '/v1/proxy/:file'], async (req, res) => {
 
   const stream = ['1', 'true', 'yes'].includes(String(q(req, 'stream', '')).toLowerCase());
   const mode = String(process.env.PROXY_MODE || 'redirect').toLowerCase();
-  const shouldStream = stream || mode === 'pipe' || req.method === 'HEAD';
+  // kalau lewat path /v1/proxy/<nama>.mp4 selalu pipe (Range/206), jangan redirect
+  const isFileVariant = Boolean(req.params && req.params.file);
+  const shouldStream = isFileVariant || stream || mode === 'pipe' || req.method === 'HEAD';
 
   if (!shouldStream) {
     res.setHeader('Cache-Control', 'no-store');
