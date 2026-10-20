@@ -1,327 +1,384 @@
-// Satu-satunya pintu keluar request ke upstream.
-// server.js / api/index.js tidak boleh fetch sendiri — semua lewat proxyFetch / proxyStream.
-// Host animein kena Cloudflare JS challenge dari IP datacenter, jadi path utama
-// adalah CORS worker (CF_PROXY) + header browser di bawah.
-import { request, Agent, setGlobalDispatcher, interceptors } from 'undici';
-import tls from 'tls';
+// cf.js — satu-satunya pintu keluar request.
+//
+// Temuan lapangan (2026-10-20):
+//   * xyz-api.animein.net memfilter berdasarkan FINGERPRINT TLS/HTTP2, bukan header.
+//     curl (OpenSSL/HTTP2 milik curl) -> 200. Node undici / node:https / fetch -> 403
+//     "Just a moment..." walau header 100% sama.
+//   * Karena itu transport utama = binary `curl`. Kalau curl tidak ada (mis. runtime
+//     tertentu), otomatis jatuh ke undici.
+//   * Endpoint API: cukup User-Agent browser.
+//   * Asset gambar (/assets*/...): WAJIB Referer https://animeinweb.com/
+//   * File video storages.animein.net: cukup User-Agent, mendukung Range (206).
+import { request, Agent } from 'undici';
+import { execFile, spawn } from 'node:child_process';
 
-const UA_POOL = [
-  {
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    ch: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    pf: '"Windows"'
-  },
-  {
-    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    ch: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    pf: '"macOS"'
-  },
-  {
-    ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    ch: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    pf: '"Linux"'
-  },
-  {
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    ch: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    pf: '"Windows"'
-  }
+const UAS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 13; SM-A035F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36'
 ];
 
-const DEFAULT_CF_PROXY = 'https://cf.tiyanstores.workers.dev/';
-const DEFAULT_PROXY_SECRET = 'animein-secure-proxy-key-123';
-const CF_PROTECTED_HOSTS = /(^|\.)animein\.net$|(^|\.)animeinweb\.com$/i;
+export const DEFAULT_BASE_API = 'https://xyz-api.animein.net/3/2';
 
-function getCfProxy() {
-  return (process.env.CF_PROXY || DEFAULT_CF_PROXY).replace(/\/?$/, '/');
+export function baseApi() {
+  return (process.env.BASE_API || DEFAULT_BASE_API).replace(/\/+$/, '');
 }
 
-function getProxySecret() {
-  return process.env.PROXY_SECRET || DEFAULT_PROXY_SECRET;
+export function refererSite() {
+  return process.env.REFERER_SITE || 'https://animeinweb.com/';
 }
 
-const defaultCiphers = tls.DEFAULT_CIPHERS.split(':');
-const shuffledCiphers = [
-  defaultCiphers[1],
-  defaultCiphers[2],
-  defaultCiphers[0],
-  ...defaultCiphers.slice(3)
-].join(':');
+const STATUS_MARK = '\n__HTTP_STATUS__:';
 
-const agent = new Agent({
-  allowH2: true,
-  keepAliveTimeout: 30000,
-  keepAliveMaxTimeout: 60000,
-  connect: {
-    ciphers: shuffledCiphers,
-    rejectUnauthorized: true
+const agent = new Agent({ keepAliveTimeout: 25000, connect: { rejectUnauthorized: true } });
+
+function pickUA(seed) {
+  if (Number.isInteger(seed)) return UAS[seed % UAS.length];
+  return UAS[Math.floor(Math.random() * UAS.length)];
+}
+
+function hostOf(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch { return ''; }
+}
+
+export function isAnimeinHost(url) {
+  const h = hostOf(url);
+  return h === 'animein.net' || h.endsWith('.animein.net') || h === 'animeinweb.com' || h.endsWith('.animeinweb.com');
+}
+
+export function isAllowedProxyTarget(url) {
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol)) return false;
+    return isAnimeinHost(url);
+  } catch { return false; }
+}
+
+function kindOf(url) {
+  const h = hostOf(url);
+  const path = (() => { try { return new URL(url).pathname; } catch { return ''; } })();
+  if (h.startsWith('storages.') || h.startsWith('cdn.')) return 'media';
+  if (path.includes('/assets')) return 'asset';
+  return 'api';
+}
+
+function headersFor(url, ua, extra = {}) {
+  const kind = kindOf(url);
+  const h = {
+    'User-Agent': ua,
+    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7'
+  };
+  if (kind === 'api') {
+    h.Accept = 'application/json, text/plain, */*';
+  } else {
+    h.Referer = refererSite();
+    h.Origin = new URL(refererSite()).origin;
+    h.Accept = kind === 'asset'
+      ? 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+      : '*/*';
   }
-}).compose(
-  interceptors.redirect({ maxRedirections: 5 }),
-  interceptors.retry({ maxRetries: 2 })
-);
+  return { ...h, ...extra };
+}
 
-setGlobalDispatcher(agent);
+// ---------------------------------------------------------------- transport
+let transportPromise = null;
+
+function curlVersion() {
+  return new Promise(resolve => {
+    execFile('curl', ['--version'], { timeout: 4000 }, (err, stdout) => {
+      if (err) return resolve(null);
+      const first = String(stdout || '').split('\n')[0].trim();
+      return resolve(first || 'curl');
+    });
+  });
+}
+
+export async function transportInfo() {
+  if (!transportPromise) {
+    transportPromise = (async () => {
+      const forced = String(process.env.USE_CURL ?? '').toLowerCase();
+      if (forced === '0' || forced === 'false' || forced === 'off') {
+        return { kind: 'undici', version: null, reason: 'USE_CURL=0' };
+      }
+      const v = await curlVersion();
+      if (v) return { kind: 'curl', version: v, reason: 'auto' };
+      return { kind: 'undici', version: null, reason: 'curl tidak tersedia' };
+    })();
+  }
+  return transportPromise;
+}
+
+export async function transportName() {
+  return (await transportInfo()).kind;
+}
+
+function execCurl(args, timeoutMs, encoding = 'utf8', maxBuffer = 48 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    execFile('curl', args, { timeout: timeoutMs + 3000, maxBuffer, encoding }, (err, stdout, stderr) => {
+      if (err && (!stdout || stdout.length === 0)) {
+        const msg = String(stderr || err.message || '').trim().split('\n')[0];
+        return reject(new Error(`curl gagal: ${msg || 'unknown error'}`));
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+function curlArgsFor(url, { ua, extraHeaders, timeoutMs, withStatus = true, noCompress = false }) {
+  const headers = headersFor(url, ua, extraHeaders);
+  const args = ['-sS', '-m', String(Math.max(1, Math.ceil(timeoutMs / 1000)))];
+  if (!noCompress) args.push('--compressed');
+  for (const [k, v] of Object.entries(headers)) {
+    if (v === undefined || v === null || v === '') continue;
+    args.push('-H', `${k}: ${v}`);
+  }
+  if (withStatus) args.push('-w', STATUS_MARK + '%{http_code}');
+  args.push('--url', url);
+  return args;
+}
+
+function splitStatus(text) {
+  const i = text.lastIndexOf(STATUS_MARK);
+  if (i < 0) return { status: 0, body: text };
+  const status = Number(text.slice(i + STATUS_MARK.length).trim()) || 0;
+  return { status, body: text.slice(0, i) };
+}
+
+function splitStatusBuffer(buf) {
+  const mark = Buffer.from(STATUS_MARK);
+  const i = buf.lastIndexOf(mark);
+  if (i < 0) return { status: 0, body: buf };
+  const status = Number(buf.slice(i + mark.length).toString('utf8').trim()) || 0;
+  return { status, body: buf.slice(0, i) };
+}
+
+export class HttpError extends Error {
+  constructor(message, { status = 0, via = 'unknown', body = '' } = {}) {
+    super(message);
+    this.name = 'HttpError';
+    this.statusCode = status;
+    this.via = via;
+    this.body = String(body || '').slice(0, 400);
+  }
+}
+
+export function isCloudflareChallenge(status, text = '') {
+  if (![403, 429, 503].includes(Number(status))) return false;
+  return /just a moment|cf-chl|challenge-platform|cdn-cgi\/challenge|attention required|enable javascript and cookies|_cf_chl_opt/i.test(String(text));
+}
+
+function describe(status, text) {
+  if (isCloudflareChallenge(status, text)) {
+    return `Cloudflare challenge [${status}] — transport tidak lolos fingerprint`;
+  }
+  const snippet = String(text || '').replace(/\s+/g, ' ').slice(0, 200);
+  return snippet ? `Upstream ${status}: ${snippet}` : `Upstream ${status}`;
+}
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function pickUA() {
-  return UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
+const RETRY_STATUS = new Set([403, 429, 500, 502, 503, 504]);
+
+// ------------------------------------------------------------- public API
+export async function fetchText(url, opts = {}) {
+  const timeoutMs = opts.timeout ?? Number(process.env.UPSTREAM_TIMEOUT_MS || 15000);
+  const attempts = opts.attempts ?? 2;
+  const t = await transportInfo();
+  let lastErr = null;
+
+  for (let i = 0; i < attempts; i++) {
+    const ua = pickUA(opts.uaSeed ?? (attempts > 1 ? i : undefined));
+    try {
+      let status;
+      let body;
+      let via = t.kind;
+
+      if (t.kind === 'curl') {
+        const out = await execCurl(curlArgsFor(url, { ua, extraHeaders: opts.headers, timeoutMs }), timeoutMs);
+        ({ status, body } = splitStatus(String(out)));
+      } else {
+        const r = await request(url, {
+          method: 'GET',
+          headers: headersFor(url, ua, opts.headers),
+          headersTimeout: timeoutMs,
+          bodyTimeout: timeoutMs,
+          dispatcher: agent
+        });
+        status = r.statusCode;
+        body = await r.body.text();
+      }
+
+      if (status >= 200 && status < 300) return { status, text: body, via };
+
+      lastErr = new HttpError(describe(status, body), { status, via, body });
+      if (i < attempts - 1 && RETRY_STATUS.has(status)) {
+        await sleep(250 + i * 400);
+        continue;
+      }
+      throw lastErr;
+    } catch (e) {
+      if (e instanceof HttpError) {
+        if (i < attempts - 1 && RETRY_STATUS.has(e.statusCode)) { await sleep(250 + i * 400); continue; }
+        throw e;
+      }
+      lastErr = new HttpError(`Request gagal: ${e.message}`, { via: t.kind });
+      if (i < attempts - 1) { await sleep(300); continue; }
+      throw lastErr;
+    }
+  }
+  throw lastErr || new HttpError('Request gagal');
 }
 
-export function viaWorker(targetUrl) {
-  return `${getCfProxy()}?url=${encodeURIComponent(targetUrl)}`;
-}
-
-export function isProtectedHost(targetUrl) {
+export async function fetchJson(url, opts = {}) {
+  const { status, text, via } = await fetchText(url, opts);
+  if (!text || !text.trim()) {
+    throw new HttpError('Upstream mengembalikan body kosong', { status, via, body: text });
+  }
   try {
-    return CF_PROTECTED_HOSTS.test(new URL(targetUrl).hostname);
+    return JSON.parse(text);
   } catch {
-    return false;
+    throw new HttpError('Upstream bukan JSON', { status, via, body: text });
   }
 }
 
-export function isCloudflareChallenge(statusCode, text = '') {
-  if (![403, 429, 503].includes(Number(statusCode))) return false;
-  return /just a moment|cf-chl|challenge-platform|cdn-cgi\/challenge|enable javascript and cookies|_cf_chl_opt/i.test(String(text));
-}
+export async function fetchBuffer(url, opts = {}) {
+  const timeoutMs = opts.timeout ?? Number(process.env.UPSTREAM_TIMEOUT_MS || 15000);
+  const t = await transportInfo();
+  const ua = pickUA(opts.uaSeed);
 
-function browserHeaders(targetUrl, extra = {}) {
-  const ua = pickUA();
-  const urlObj = new URL(targetUrl);
-  const originUrl = `${urlObj.protocol}//${urlObj.host}`;
-  return {
-    'User-Agent': ua.ua,
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Origin': originUrl,
-    'Referer': `${originUrl}/`,
-    'X-Requested-With': 'XMLHttpRequest',
-    'X-Proxy-Secret': extra.secret || getProxySecret(),
-    'Sec-Ch-Ua': ua.ch,
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': ua.pf,
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'Connection': 'keep-alive',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    ...extra.headers
-  };
-}
-
-function buildAttempts(targetUrl, opts = {}) {
-  const attempts = [];
-  const workerFirst = opts.forceWorker || isProtectedHost(targetUrl);
-
-  if (workerFirst) {
-    attempts.push({ kind: 'worker', url: viaWorker(targetUrl) });
-    if (!opts.workerOnly) attempts.push({ kind: 'direct', url: targetUrl });
-  } else {
-    attempts.push({ kind: 'direct', url: targetUrl });
-    attempts.push({ kind: 'worker', url: viaWorker(targetUrl) });
+  if (t.kind === 'curl') {
+    const out = await execCurl(
+      curlArgsFor(url, { ua, extraHeaders: opts.headers, timeoutMs, noCompress: true }),
+      timeoutMs,
+      'buffer',
+      Number(opts.maxBytes || 32 * 1024 * 1024)
+    );
+    const { status, body } = splitStatusBuffer(out);
+    return { status, buffer: body, via: t.kind };
   }
 
-  return attempts;
-}
-
-function summarizeError(statusCode, text) {
-  if (isCloudflareChallenge(statusCode, text)) {
-    return `Cloudflare challenge (Just a moment...) [status ${statusCode}]`;
-  }
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed?.message) return `${parsed.message} (status ${statusCode})`;
-  } catch { /* ignore */ }
-  const snippet = String(text || '').replace(/\s+/g, ' ').slice(0, 240);
-  return snippet ? `Target returned status ${statusCode}: ${snippet}` : `Target returned status ${statusCode}`;
-}
-
-async function requestText(url, headers, timeouts = {}) {
-  const { statusCode, headers: resHeaders, body } = await request(url, {
+  const r = await request(url, {
     method: 'GET',
-    headers,
-    headersTimeout: timeouts.headersTimeout ?? 10000,
-    bodyTimeout: timeouts.bodyTimeout ?? 20000
+    headers: headersFor(url, ua, opts.headers),
+    headersTimeout: timeoutMs,
+    bodyTimeout: timeoutMs,
+    dispatcher: agent
   });
-  const text = await body.text();
-  return { statusCode, resHeaders, text };
+  const chunks = [];
+  for await (const c of r.body) chunks.push(c);
+  return { status: r.statusCode, buffer: Buffer.concat(chunks), via: t.kind };
 }
 
-export async function proxyFetch(targetUrl, opts = {}) {
-  const attempts = buildAttempts(targetUrl, opts);
-  let lastErr = null;
+function parseHeaders(block) {
+  const out = {};
+  for (const line of String(block).split(/\r?\n/)) {
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    const k = line.slice(0, idx).trim().toLowerCase();
+    const v = line.slice(idx + 1).trim();
+    if (!k) continue;
+    out[k] = out[k] ? `${out[k]}, ${v}` : v;
+  }
+  return out;
+}
 
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-    const headers = browserHeaders(targetUrl, {
-      secret: opts.secret,
-      headers: opts.headers
-    });
+// Ambil status + header tanpa mengunduh body besar.
+export async function probe(url, opts = {}) {
+  const timeoutMs = opts.timeout ?? 12000;
+  const t = await transportInfo();
+  const ua = pickUA(opts.uaSeed);
 
-    if (attempt.kind === 'direct') {
-      headers.Host = new URL(targetUrl).host;
+  if (t.kind === 'curl') {
+    const args = ['-sS', '-m', String(Math.ceil(timeoutMs / 1000)), '-I', '--url', url];
+    for (const [k, v] of Object.entries(headersFor(url, ua, opts.headers))) {
+      if (v) args.push('-H', `${k}: ${v}`);
     }
+    args.push('-D', '-', '-o', '/dev/null');
 
-    try {
-      const { statusCode, resHeaders, text } = await requestText(attempt.url, headers);
+    const raw = await execCurl(args, timeoutMs).catch(() => '');
+    const blocks = String(raw).split(/\r?\n\r?\n/).filter(Boolean);
+    const last = blocks[blocks.length - 1] || '';
+    const statusLine = last.split(/\r?\n/)[0] || '';
+    const status = Number((statusLine.match(/HTTP\/[\d.]+\s+(\d{3})/) || [])[1] || 0);
+    if (status) return { status, headers: parseHeaders(last), via: 'curl' };
 
-      if (statusCode === 200) {
-        try {
-          return JSON.parse(text);
-        } catch {
-          return { raw: text };
-        }
-      }
-
-      const err = new Error(summarizeError(statusCode, text));
-      err.statusCode = statusCode;
-      err.via = attempt.kind;
-      err.headers = resHeaders;
-      try {
-        err.body = JSON.parse(text);
-      } catch {
-        err.body = String(text || '').slice(0, 400);
-      }
-
-      lastErr = err;
-
-      const retryable = isCloudflareChallenge(statusCode, text) || statusCode === 403 || statusCode >= 500;
-      if (retryable && i < attempts.length - 1) {
-        await sleep(200 + i * 300);
-        continue;
-      }
-      throw err;
-    } catch (err) {
-      if (!err.statusCode) {
-        lastErr = new Error(`${attempt.kind} fetch failed: ${err.message}`);
-        lastErr.via = attempt.kind;
-        if (i < attempts.length - 1) {
-          await sleep(250 + i * 350);
-          continue;
-        }
-        throw lastErr;
-      }
-      lastErr = err;
-      if (i < attempts.length - 1) {
-        await sleep(200 + i * 300);
-        continue;
-      }
-      throw err;
+    // HEAD tidak didukung -> sniff pakai range 1 byte
+    const probeArgs = ['-sS', '-m', String(Math.ceil(timeoutMs / 1000)), '-r', '0-0', '-D', '-', '-o', '/dev/null', '--url', url];
+    for (const [k, v] of Object.entries(headersFor(url, ua, opts.headers))) {
+      if (v) probeArgs.push('-H', `${k}: ${v}`);
     }
+    const raw2 = await execCurl(probeArgs, timeoutMs).catch(() => '');
+    const blocks2 = String(raw2).split(/\r?\n\r?\n/).filter(Boolean);
+    const last2 = blocks2[blocks2.length - 1] || '';
+    const s2 = Number(((last2.split(/\r?\n/)[0] || '').match(/HTTP\/[\d.]+\s+(\d{3})/) || [])[1] || 0);
+    return { status: s2, headers: parseHeaders(last2), via: 'curl' };
   }
 
-  throw lastErr || new Error('Target fetch failed on all paths');
+  const r = await request(url, {
+    method: 'HEAD',
+    headers: headersFor(url, ua, opts.headers),
+    headersTimeout: timeoutMs,
+    dispatcher: agent
+  });
+  try { r.body.dump(); } catch { /* ignore */ }
+  return { status: r.statusCode, headers: r.headers, via: 'undici' };
 }
 
-export async function fetchJson(url, options = {}) {
-  const ua = pickUA();
-  let lastErr = null;
-  for (let i = 0; i < 2; i++) {
-    try {
-      const { statusCode, body } = await request(url, {
-        method: 'GET',
-        headers: {
-          'User-Agent': ua.ua,
-          'Accept': 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
-          ...options.headers
-        },
-        headersTimeout: 5000,
-        bodyTimeout: 8000
-      });
-      const txt = await body.text();
-      if (statusCode !== 200) {
-        throw new Error(`Jikan returned ${statusCode}: ${txt.slice(0, 200)}`);
-      }
-      return JSON.parse(txt);
-    } catch (e) {
-      lastErr = e;
-      if (i < 1) await sleep(300 + i * 400);
+// Stream body ke Express response (dipakai /v1/proxy).
+export async function pipeTo(url, res, opts = {}) {
+  const range = opts.range || null;
+  // HEAD ikut membawa Range supaya dapat 206 + Content-Range/Content-Length yang benar.
+  const info = await probe(url, { uaSeed: opts.uaSeed, headers: range ? { Range: range } : {} }).catch(() => null);
+
+  const passthrough = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
+  if (info?.status && [200, 206].includes(info.status)) {
+    res.status(info.status);
+    for (const k of passthrough) {
+      if (info.headers[k]) res.setHeader(k, info.headers[k]);
     }
+  } else {
+    res.status(200);
   }
-  throw lastErr;
-}
+  if (!res.getHeader('content-type')) res.setHeader('content-type', 'application/octet-stream');
+  res.setHeader('cache-control', 'public, max-age=3600');
 
-export async function proxyStream(targetUrl, incomingHeaders = {}) {
-  const attempts = buildAttempts(targetUrl);
-  let lastErr = null;
+  const t = await transportInfo();
+  const ua = pickUA(opts.uaSeed);
+  const timeoutMs = opts.timeout ?? Number(process.env.STREAM_TIMEOUT_MS || 600000);
 
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-    const ua = pickUA();
-    const urlObj = new URL(targetUrl);
-
-    const headersToSend = {
-      'User-Agent': ua.ua,
-      'Accept': incomingHeaders.accept || incomingHeaders['accept'] || '*/*',
-      'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Origin': 'https://animeinweb.com',
-      'Referer': 'https://animeinweb.com/',
-      'X-Requested-With': 'XMLHttpRequest',
-      'X-Proxy-Secret': getProxySecret(),
-      'Sec-Ch-Ua': ua.ch,
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': ua.pf,
-      'Sec-Fetch-Dest': 'video',
-      'Sec-Fetch-Mode': 'no-cors',
-      'Sec-Fetch-Site': 'cross-site',
-      'Connection': 'keep-alive'
-    };
-
-    if (attempt.kind === 'direct') {
-      headersToSend.Host = urlObj.host;
+  if (t.kind === 'curl') {
+    const args = ['-sS', '-m', String(Math.ceil(timeoutMs / 1000))];
+    for (const [k, v] of Object.entries(headersFor(url, ua, opts.headers))) {
+      if (v && k.toLowerCase() !== 'accept-encoding') args.push('-H', `${k}: ${v}`);
     }
-    if (incomingHeaders.range || incomingHeaders.Range) {
-      headersToSend.Range = incomingHeaders.range || incomingHeaders.Range;
-    }
+    if (range) args.push('-H', `Range: ${range}`);
+    args.push('--url', url);
 
-    try {
-      const { statusCode, headers, body } = await request(attempt.url, {
-        method: 'GET',
-        headers: headersToSend
-      });
-
-      if ([403, 429, 503].includes(Number(statusCode)) && i < attempts.length - 1) {
-        try { body.dump(); } catch { /* ignore */ }
-        lastErr = new Error(`Blocked status ${statusCode} on ${attempt.kind} stream`);
-        lastErr.statusCode = statusCode;
-        continue;
-      }
-
-      return { statusCode, headers, body, via: attempt.kind };
-    } catch (err) {
-      lastErr = err;
-      if (i < attempts.length - 1) {
-        await sleep(200);
-        continue;
-      }
-      throw err;
-    }
+    const child = spawn('curl', args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    child.stdout.pipe(res);
+    const kill = () => { try { child.kill('SIGTERM'); } catch { /* ignore */ } };
+    res.on('close', kill);
+    child.on('error', () => { try { res.end(); } catch { /* ignore */ } });
+    child.on('close', () => { try { res.end(); } catch { /* ignore */ } });
+    return { via: 'curl', upstream: info?.status || 0 };
   }
 
-  throw lastErr || new Error('Stream failed on all paths');
+  const headers = headersFor(url, ua, opts.headers);
+  if (range) headers.Range = range;
+  const r = await request(url, { method: 'GET', headers, dispatcher: agent, bodyTimeout: timeoutMs });
+  res.status(r.statusCode);
+  try { await r.body.pipe(res); } catch { /* ignore */ }
+  return { via: 'undici', upstream: r.statusCode };
 }
 
-export async function testSecrets(targetUrl, secrets) {
-  const results = [];
-  for (const sec of secrets) {
-    try {
-      const data = await proxyFetch(targetUrl, { secret: sec });
-      results.push({ secret: sec, success: true, status: 200, sample: JSON.stringify(data).slice(0, 200) });
-    } catch (e) {
-      results.push({ secret: sec, success: false, status: e.statusCode || 0, via: e.via, message: e.message, body: e.body });
-    }
-  }
-  return results;
-}
-
-export function getProxyConfig() {
+export function proxyConfig() {
   return {
-    cf_proxy: getCfProxy(),
-    proxy_secret_set: Boolean(process.env.PROXY_SECRET)
+    base_api: baseApi(),
+    referer: refererSite(),
+    use_curl: String(process.env.USE_CURL ?? 'auto'),
+    upstream_timeout_ms: Number(process.env.UPSTREAM_TIMEOUT_MS || 15000)
   };
 }
