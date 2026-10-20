@@ -160,7 +160,7 @@ app.get('/', (req, res) => {
   res.json({
     status: true,
     message: 'Aisoft API is running',
-    version: '2.0.0',
+    version: '2.1.0',
     docs: `${publicOrigin(req)}/v1/health`,
     endpoints: [
       '/v1/health',
@@ -175,6 +175,7 @@ app.get('/', (req, res) => {
       '/v1/episodes?id=426&page=0',
       '/v1/episode?id=321196',
       '/v1/proxy?url=<encoded>&stream=1',
+      '/v1/p/<file>.mp4?url=<encoded>',
       '/v1/img?url=<encoded>'
     ]
   });
@@ -214,7 +215,7 @@ app.get('/v1/health', async (req, res) => {
 
   res.json({
     status: true,
-    version: '2.0.0',
+    version: '2.1.0',
     uptime_s: Math.round(process.uptime()),
     transport,
     config: proxyConfig(),
@@ -653,9 +654,16 @@ app.get('/v1/episode', async (req, res) => {
     const origin = publicOrigin(req);
     const servers = (Array.isArray(data.server) ? data.server : []).map(s => {
       const raw = s.link || '';
+      // Frontend (Nefusoft) memutar video lewat helper yang membungkus URL apa pun
+      // ke cf.tiyanstores.workers.dev lalu mengecek `link.split('?')[0].endsWith('.mp4')`.
+      // CDN animein menolak worker (403) dan menolak browser tanpa Referer, jadi
+      // `link` sengaja diarahkan ke proxy milik API ini dengan path berakhiran .mp4.
+      const quality = String(s.quality || 'auto').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || 'auto';
+      const proxyName = `${id}-${quality}.mp4`;
       return {
         ...s,
-        link: raw,
+        link: raw ? `${origin}/v1/p/${proxyName}?url=${encodeURIComponent(raw)}` : raw,
+        source_url: raw || null,
         play_url: raw ? `${origin}/v1/proxy?url=${encodeURIComponent(raw)}` : null,
         stream_url: raw ? `${origin}/v1/proxy?url=${encodeURIComponent(raw)}&stream=1` : null
       };
@@ -677,6 +685,34 @@ app.get('/v1/episode', async (req, res) => {
     const info = errInfo(e);
     mark(res, { source: 'error', ttlMs: 0, error: info.message });
     return res.status(502).json({ status: false, message: 'Gagal mengambil link streaming', detail: info });
+  }
+});
+
+// ------------------------------------------------------------- stream (.mp4 path)
+// Alias /v1/proxy dengan nama file berakhiran .mp4, dipakai player web yang
+// mendeteksi direct-mp4 lewat akhiran path.
+app.get(['/v1/p', '/v1/p/:file'], async (req, res) => {
+  const raw = q(req, 'url', '');
+  if (!raw) return res.status(400).json({ status: false, message: 'parameter url wajib diisi' });
+
+  const target = decodeTarget(raw);
+  if (!/^https?:\/\//i.test(target)) return res.status(400).json({ status: false, message: 'url harus http(s) absolute' });
+  if (!isAllowedProxyTarget(target)) {
+    return res.status(403).json({ status: false, message: 'host tidak diizinkan', hint: 'hanya *.animein.net / animeinweb.com' });
+  }
+
+  try {
+    const range = req.headers.range;
+    const out = await pipeTo(target, res, { range });
+    res.setHeader('X-Proxy-Via', out.via);
+    res.setHeader('X-Proxy-Upstream', String(out.upstream));
+  } catch (e) {
+    const info = errInfo(e);
+    if (!res.headersSent) {
+      res.status(502).json({ status: false, message: 'Gagal mem-proxy', detail: info });
+    } else {
+      try { res.end(); } catch { /* ignore */ }
+    }
   }
 });
 
@@ -761,7 +797,7 @@ app.use((req, res) => {
   res.status(404).json({
     status: false,
     message: 'Endpoint tidak ditemukan',
-    available: ['/v1/health', '/v1/genre', '/v1/popular', '/v1/search', '/v1/schedule', '/v1/ongoing', '/v1/detail', '/v1/episodes', '/v1/episode', '/v1/proxy', '/v1/img']
+    available: ['/v1/health', '/v1/genre', '/v1/popular', '/v1/search', '/v1/schedule', '/v1/ongoing', '/v1/detail', '/v1/episodes', '/v1/episode', '/v1/proxy', '/v1/p/<file>.mp4', '/v1/img']
   });
 });
 

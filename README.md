@@ -74,6 +74,7 @@ Header yang memang dibutuhkan (sudah otomatis):
 | `GET /v1/episode?id=321196` | link streaming 360p/480p/720p/1080p + `play_url` |
 | `GET /v1/proxy?url=<encoded>` | 302 ke CDN (default) — hemat bandwidth |
 | `GET /v1/proxy?url=<encoded>&stream=1` | server yang streaming (mendukung `Range`) |
+| `GET /v1/p/<file>.mp4?url=<encoded>` | **v2.1.0** — sama seperti `/v1/proxy` tapi path berakhiran `.mp4` (dipakai player web yang mendeteksi direct-mp4 dari akhiran path) |
 | `GET /v1/img?url=<encoded>` | proxy gambar (menambahkan `Referer` yang diminta upstream) |
 
 Semua respons lama tetap sama bentuknya (`{ status, data }`), jadi client lama tidak pecah.
@@ -256,3 +257,21 @@ Catatan platform:
 * Fallback AniList menggantikan Jikan (Jikan timeout 20–30 detik dari IP ini).
 * Cache TTL + stale fallback, header diagnostik, `/v1/health` informatif.
 * Endpoint debug `secret-test` dihapus; pesan error dibersihkan; `.env` keluar dari repo.
+
+
+## Catatan: field `link` di `/v1/episode`
+
+Sejak **v2.1.0**, `server[].link` **bukan lagi URL mentah CDN**, tapi URL proxy milik API ini:
+
+```
+https://<host>/v1/p/<episodeId>-<quality>.mp4?url=<cdn-asli>
+```
+
+Alasannya: frontend web (`nefusoft2.tiyan.my.id`) membungkus setiap URL media dengan
+`https://cf.tiyanstores.workers.dev/?url=...` lalu memeriksa
+`link.split('?')[0].endsWith('.mp4')` untuk memutuskan `<video>` native atau iframe.
+CDN `storages.animein.net` menolak request dari worker Cloudflare (403) dan menolak
+browser tanpa `Referer: https://animeinweb.com/`, jadi video tidak bisa diputar.
+
+Dengan `link` diarahkan ke proxy ini (path `.mp4`, Range/206 didukung), player tetap
+memutar lewat jalur apa pun. URL CDN asli masih tersedia di `server[].source_url`.
