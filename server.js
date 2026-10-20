@@ -717,7 +717,7 @@ app.get(['/v1/p', '/v1/p/:file'], async (req, res) => {
 });
 
 // --------------------------------------------------------------------- proxy
-app.get('/v1/proxy', async (req, res) => {
+app.get(['/v1/proxy', '/v1/proxy/:file'], async (req, res) => {
   const raw = q(req, 'url', '');
   if (!raw) return res.status(400).json({ status: false, message: 'parameter url wajib diisi' });
 
