@@ -342,7 +342,9 @@ export async function pipeTo(url, res, opts = {}) {
   } else {
     res.status(200);
   }
-  if (!res.getHeader('content-type')) res.setHeader('content-type', 'application/octet-stream');
+  if (!res.getHeader('content-type')) res.setHeader('content-type', opts.contentType || 'application/octet-stream');
+  // upstream kadang kirim octet-stream untuk .mp4 -> paksa video/mp4 biar <video> mau memutar
+  else if (opts.contentType && String(res.getHeader('content-type')).includes('octet-stream')) res.setHeader('content-type', opts.contentType);
   res.setHeader('cache-control', 'public, max-age=3600');
 
   const t = await transportInfo();

@@ -703,7 +703,7 @@ app.get(['/v1/p', '/v1/p/:file'], async (req, res) => {
 
   try {
     const range = req.headers.range;
-    const out = await pipeTo(target, res, { range });
+    const out = await pipeTo(target, res, { range, contentType: 'video/mp4' });
     res.setHeader('X-Proxy-Via', out.via);
     res.setHeader('X-Proxy-Upstream', String(out.upstream));
   } catch (e) {
@@ -740,7 +740,7 @@ app.get(['/v1/proxy', '/v1/proxy/:file'], async (req, res) => {
 
   try {
     const range = req.headers.range;
-    const out = await pipeTo(target, res, { range });
+    const out = await pipeTo(target, res, { range, contentType: isFileVariant ? 'video/mp4' : undefined });
     res.setHeader('X-Proxy-Via', out.via);
     res.setHeader('X-Proxy-Upstream', String(out.upstream));
   } catch (e) {
