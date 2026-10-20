@@ -8,6 +8,19 @@ cadangan otomatis **AniList** (GraphQL, tanpa API key). Jalan lokal di Termux/No
 
 Semua endpoint sudah **terverifikasi hidup** (25/25 smoke test lolos, lihat `npm test`).
 
+**Base URL production**
+
+| URL | Keterangan |
+|---|---|
+| `https://apisoft.tiyan.my.id` | domain utama (custom, SSL otomatis) |
+| `https://www.apisoft.tiyan.my.id` | redirect 308 ke domain utama |
+| `https://aisoft2-api.vercel.app` | alias Vercel (tetap aktif) |
+
+```bash
+curl https://apisoft.tiyan.my.id/v1/health
+curl "https://apisoft.tiyan.my.id/v1/search?q=frieren"
+```
+
 ---
 
 ## Akar masalah 403 "Just a moment..." (dan solusinya)
@@ -137,8 +150,23 @@ cd Aisoft2- && npm install && npm start
 
 ## Deploy ke Vercel
 
-Production: **https://aisoft2-api.vercel.app** (project `aisoft2-api`, team
+Production: **https://apisoft.tiyan.my.id** (custom domain) — alias Vercel
+**https://aisoft2-api.vercel.app** (project `aisoft2-api`, team
 `tiyanpalestines-projects`).
+
+Custom domain dikelola lewat Vercel (`tiyan.my.id` DNS-nya sudah pakai
+nameserver Vercel), jadi SSL terbit otomatis. `www.apisoft.tiyan.my.id`
+dipasang sebagai **redirect 308** ke domain utama. Kalau mau ganti domain:
+
+```bash
+# daftarkan domain ke project (Vercel CLI)
+vercel domains add apisoft.tiyan.my.id
+vercel alias set <deployment-url> apisoft.tiyan.my.id
+```
+
+Atau lewat API: `POST /v10/projects/{projectId}/domains` body
+`{"name":"domain.kamu"}` (untuk redirect: tambahkan `redirect` +
+`redirectStatusCode`).
 
 Repo ini sudah **tersambung ke project Vercel** (`link: github tiyanzxbellas/Aisoft2-`,
 production branch `main`). Artinya: **push ke `main` = deploy otomatis**, tidak perlu
