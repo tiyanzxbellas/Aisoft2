@@ -1,5 +1,7 @@
 # Aisoft2 API — v2.0.0
 
+[![CI](https://github.com/tiyanzxbellas/Aisoft2-/actions/workflows/ci.yml/badge.svg)](https://github.com/tiyanzxbellas/Aisoft2-/actions/workflows/ci.yml)
+
 REST API anime berbahasa Indonesia. Sumber utama **animein** (`xyz-api.animein.net`),
 cadangan otomatis **AniList** (GraphQL, tanpa API key). Jalan lokal di Termux/Node
 18+ maupun dideploy ke Vercel.
@@ -135,6 +137,15 @@ cd Aisoft2- && npm install && npm start
 
 ## Deploy ke Vercel
 
+Production: **https://aisoft2-api.vercel.app** (project `aisoft2-api`, team
+`tiyanpalestines-projects`).
+
+Repo ini sudah **tersambung ke project Vercel** (`link: github tiyanzxbellas/Aisoft2-`,
+production branch `main`). Artinya: **push ke `main` = deploy otomatis**, tidak perlu
+langkah manual lagi.
+
+Kalau mau deploy dari nol (fork / project baru):
+
 1. Import repo ini ke Vercel (framework: **Other**, tidak perlu build command).
 2. Environment Variables (opsional, default sudah aman):
 
@@ -146,6 +157,8 @@ cd Aisoft2- && npm install && npm start
    ```
 
 3. Deploy. `vercel.json` me-rewrite semua path ke `api/index.js` (Express app yang sama).
+4. **Matikan Deployment Protection** (Settings → Deployment Protection → Vercel
+   Authentication: *Disabled*), kalau tidak semua URL balik 302 ke `vercel.com/sso-api`.
 
 Catatan platform:
 
@@ -186,6 +199,9 @@ Catatan platform:
 │   └── images.js    # normalisasi URL asset + pembuat URL /v1/img
 ├── test.js          # smoke test end-to-end
 ├── vercel.json
+├── package-lock.json # lockfile ikut di-commit (build reproducible)
+├── .github/workflows/ci.yml  # CI: sintaks + boot + smoke lokal
+├── LICENSE          # MIT
 └── .env.example
 ```
 
@@ -195,6 +211,8 @@ Catatan platform:
 
 * `.env` **tidak** ikut di-commit (ada di `.gitignore`). Simpan konfigurasi
   production di dashboard Vercel.
+* Jangan pernah menaruh token/kunci di file yang di-commit; kalau terlanjur, revoke
+  lalu ganti.
 * `/v1/proxy` dan `/v1/img` hanya menerima host `*.animein.net` / `animeinweb.com`,
   jadi tidak bisa dipakai sebagai open proxy.
 * Argumen `curl` disusun sebagai array (`execFile`/`spawn`), tidak lewat shell.

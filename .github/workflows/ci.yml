@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Cek sintaks
+        run: |
+          for f in server.js cf.js test.js api/index.js lib/*.js; do
+            echo "check $f"
+            node --check "$f"
+          done
+
+      - name: Boot server + smoke lokal
+        run: |
+          PORT=3999 LOG=0 node server.js > server.log 2>&1 &
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:3999/ > /dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3999/ > /dev/null
+          curl -fsS http://127.0.0.1:3999/v1/genre > /dev/null
+          curl -fsS http://127.0.0.1:3999/v1/schedule?day=SENIN > /dev/null
+          echo "smoke lokal OK"
+
+      - name: Smoke test lengkap (butuh jaringan ke upstream)
+        continue-on-error: true
+        run: npm test
