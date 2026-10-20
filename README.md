@@ -1,6 +1,6 @@
-# Aisoft2 API — v2.0.0
+# Aisoft2 API — v2.1.1
 
-[![CI](https://github.com/tiyanzxbellas/Aisoft2-/actions/workflows/ci.yml/badge.svg)](https://github.com/tiyanzxbellas/Aisoft2-/actions/workflows/ci.yml)
+[![CI](https://github.com/tiyanzxbellas/Aisoft2/actions/workflows/ci.yml/badge.svg)](https://github.com/tiyanzxbellas/Aisoft2/actions/workflows/ci.yml)
 
 REST API anime berbahasa Indonesia. Sumber utama **animein** (`xyz-api.animein.net`),
 cadangan otomatis **AniList** (GraphQL, tanpa API key). Jalan lokal di Termux/Node
@@ -75,6 +75,7 @@ Header yang memang dibutuhkan (sudah otomatis):
 | `GET /v1/proxy?url=<encoded>` | 302 ke CDN (default) — hemat bandwidth |
 | `GET /v1/proxy?url=<encoded>&stream=1` | server yang streaming (mendukung `Range`) |
 | `GET /v1/p/<file>.mp4?url=<encoded>` | **v2.1.0** — sama seperti `/v1/proxy` tapi path berakhiran `.mp4` (dipakai player web yang mendeteksi direct-mp4 dari akhiran path) |
+| `GET /v1/proxy/<file>.mp4?url=<encoded>` | **v2.1.1** — path lama tetap jalan; kalau ada akhiran file, **selalu** pipe (`Range`/206) + `Content-Type: video/mp4`, tidak pernah 302 |
 | `GET /v1/img?url=<encoded>` | proxy gambar (menambahkan `Referer` yang diminta upstream) |
 
 Semua respons lama tetap sama bentuknya (`{ status, data }`), jadi client lama tidak pecah.
@@ -140,8 +141,8 @@ Di Termux:
 
 ```bash
 pkg install nodejs curl -y
-git clone https://github.com/tiyanzxbellas/Aisoft2-.git
-cd Aisoft2- && npm install && npm start
+git clone https://github.com/tiyanzxbellas/Aisoft2.git
+cd Aisoft2 && npm install && npm start
 ```
 
 > `curl` wajib ada kalau ingin data penuh dari upstream. Tanpa curl API tetap
@@ -169,7 +170,7 @@ Atau lewat API: `POST /v10/projects/{projectId}/domains` body
 `{"name":"domain.kamu"}` (untuk redirect: tambahkan `redirect` +
 `redirectStatusCode`).
 
-Repo ini sudah **tersambung ke project Vercel** (`link: github tiyanzxbellas/Aisoft2-`,
+Repo ini sudah **tersambung ke project Vercel** (`link: github tiyanzxbellas/Aisoft2`,
 production branch `main`). Artinya: **push ke `main` = deploy otomatis**, tidak perlu
 langkah manual lagi.
 
@@ -245,6 +246,29 @@ Catatan platform:
 * `/v1/proxy` dan `/v1/img` hanya menerima host `*.animein.net` / `animeinweb.com`,
   jadi tidak bisa dipakai sebagai open proxy.
 * Argumen `curl` disusun sebagai array (`execFile`/`spawn`), tidak lewat shell.
+
+## Perubahan v2.1.1 (fix streaming video)
+
+| Fix | Sebelum | Sesudah |
+|---|---|---|
+| Path lama `/v1/proxy/<nama>.mp4` | 404 (cuma `/v1/p/` yang didaftarkan) | didaftarkan — `['/v1/proxy', '/v1/proxy/:file']` |
+| `/v1/proxy/<nama>.mp4` mode default | 302 ke CDN → `<video>` tidak bisa `Range` | varian ber-akhiran file **selalu** pipe + `Range`/206 |
+| `Content-Type` video | upstream kadang `application/octet-stream` → browser menolak memutar | `pipeTo(..., { contentType: 'video/mp4' })` memaksa `video/mp4` |
+| `server[].link` | URL CDN mentah (diblokir kalau lewat worker) | `${origin}/v1/p/<epId>-<quality>.mp4?url=<cdn>` |
+
+Semua diuji di production (`https://apisoft.tiyan.my.id`):
+
+```
+GET /v1/p/317506-360p.mp4?url=...          -> 206  video/mp4  bytes 0-1048575/76998929
+GET /v1/proxy/317506-360p.mp4?url=...      -> 206  video/mp4  x-proxy-via: curl
+GET /v1/proxy?url=...&stream=1             -> 206  video/mp4  x-proxy-via: curl
+GET /v1/img?url=<poster animein>           -> 200  image/jpeg
+```
+
+> Repo ini (`tiyanzxbellas/Aisoft2`) **terhubung langsung ke Vercel** — push ke `main`
+> otomatis deploy ke production `apisoft.tiyan.my.id`.
+
+---
 
 ## Perubahan v2.0.0
 

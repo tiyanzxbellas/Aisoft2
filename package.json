@@ -1,6 +1,6 @@
 {
   "name": "aisoft2-api",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "REST API anime (animein upstream + AniList fallback) siap deploy ke Vercel atau jalan lokal",
   "type": "module",
